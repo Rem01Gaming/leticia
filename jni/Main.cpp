@@ -499,8 +499,14 @@ static int play(const std::string &file_path, const AlsaDevice &dev, bool enable
     AVFrame *frame = av_frame_alloc();
     const bool is_32bit = (best_fmt == tinyalsa::sample_format::s32_le);
     std::vector<uint8_t> pcm_buf;
+
     double current_pos_sec = 0.0;
     bool is_paused = false;
+
+    // Pre-roll discard threshold: after a seek, frames with pts below this
+    // value are decoded but not sent to ALSA, allowing the Opus/MDCT decoder
+    // to warm up its internal state before producing audible output.
+    int64_t skip_until_pts = AV_NOPTS_VALUE;
 
     while (g_running) {
         int64_t seek_req = g_seek_target.exchange(-1);
@@ -510,12 +516,21 @@ static int play(const std::string &file_path, const AlsaDevice &dev, bool enable
         } else if (seek_req == -2 || seek_req == -3) {
             double offset = (seek_req == -2) ? 5.0 : -5.0;
             double target_sec = std::max(0.0, current_pos_sec + offset);
-            int64_t target_pts = static_cast<int64_t>(target_sec / av_q2d(stream->time_base));
+            int64_t target_pts = static_cast<int64_t>(target_sec * AV_TIME_BASE);
 
-            if (av_seek_frame(fmt_ctx, audio_idx, target_pts, AVSEEK_FLAG_BACKWARD) >= 0) {
+            if (avformat_seek_file(fmt_ctx, -1, INT64_MIN, target_pts, INT64_MAX, 0) >= 0) {
                 avcodec_flush_buffers(codec_ctx);
+                writer.prepare(); // Drop stale audio in ALSA hardware buffer
                 resampler.init(codec_ctx->sample_rate, in_layout, codec_ctx->sample_fmt, out_rate, out_layout, AV_SAMPLE_FMT_S32);
                 current_pos_sec = target_sec;
+
+                /*
+                 * Convert the seek target from AV_TIME_BASE into the stream's
+                 * own time-base so we can compare directly against frame->pts.
+                 * Frames decoded before this threshold are pre-roll warmup and
+                 * must be discarded silently (required by Opus / MDCT codecs).
+                 */
+                skip_until_pts = av_rescale_q(target_pts, AV_TIME_BASE_Q, stream->time_base);
             }
         }
 
@@ -544,6 +559,23 @@ static int play(const std::string &file_path, const AlsaDevice &dev, bool enable
 
         while (avcodec_receive_frame(codec_ctx, frame) == 0) {
             if (!g_running) break;
+
+            /*
+             * Opus / MDCT pre-roll discard
+             *
+             * After a seek, FFmpeg lands on the nearest OGG page boundary
+             * *before* the requested position. The decoder has no prior state
+             * at that point, so the first few frames are corrupt. We silently
+             * decode and discard them until we reach the intended target PTS,
+             * at which point the decoder's overlap buffers are properly filled.
+             */
+            if (skip_until_pts != AV_NOPTS_VALUE && frame->pts != AV_NOPTS_VALUE) {
+                if (frame->pts < skip_until_pts) {
+                    av_frame_unref(frame);
+                    continue;
+                }
+                skip_until_pts = AV_NOPTS_VALUE;
+            }
 
             int max_out = resampler.getDelay(out_rate) + frame->nb_samples + 64;
             size_t bytes_per_sample = is_32bit ? sizeof(int32_t) : sizeof(int16_t);
