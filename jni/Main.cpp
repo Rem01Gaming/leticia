@@ -281,12 +281,15 @@ static void watch_mixer_thread() {
 }
 
 // ─── Core playback ────────────────────────────────────────────────────────────
-static int play(const std::string &file_path, const AlsaDevice &dev, bool enable_replaygain) {
+static int play(const std::string &file_path, const AlsaDevice &dev, bool enable_replaygain, bool force_software_mixer) {
     tinyalsa::size_type card = dev.card;
     tinyalsa::size_type device = dev.device;
     std::string display_name = dev.name + " [" + dev.hw_id + "]";
 
-    bool hw_mixer_available = init_hw_mixer(card);
+    bool hw_mixer_available = false;
+    if (!force_software_mixer) {
+        hw_mixer_available = init_hw_mixer(card);
+    }
     set_volume(g_volume.load());
 
     // ─── FFmpeg setup ───────────────────────────────────────────────────
@@ -607,7 +610,7 @@ static int play(const std::string &file_path, const AlsaDevice &dev, bool enable
                 continue;
             }
 
-            float effective_vol = g_volume.load() * replaygain_mult;
+            float effective_vol = SoftwareMixer::getVolumeFactor(g_volume.load()) * replaygain_mult;
             float sw_multiplier = g_hw_mixer_active ? replaygain_mult : effective_vol;
 
             if (std::abs(sw_multiplier - 1.0f) > 0.001f) {
@@ -735,14 +738,16 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc < 2) {
-        std::cerr << YELLOW << "Usage: " << argv[0] << " <file> [hw:card,device] [--replaygain]\n" << RESET;
+        std::cerr << YELLOW << "Usage: " << argv[0] << " <file> [hw:card,device] [--replaygain] [--software-mixer]\n" << RESET;
         return 1;
     }
 
     std::string file_path = argv[1];
     bool enable_replaygain = false;
+    bool force_software_mixer = false;
     for (int i = 2; i < argc; ++i) {
         if (std::string(argv[i]) == "--replaygain") enable_replaygain = true;
+        if (std::string(argv[i]) == "--software-mixer") force_software_mixer = true;
     }
 
     AlsaDevice dev;
@@ -783,5 +788,5 @@ int main(int argc, char *argv[]) {
     RawTerminal raw;
     raw.enable();
 
-    return play(file_path, dev, enable_replaygain);
+    return play(file_path, dev, enable_replaygain, force_software_mixer);
 }
