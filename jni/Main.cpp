@@ -529,14 +529,29 @@ static int play(const std::string &file_path, const AlsaDevice &dev, bool enable
     // to warm up its internal state before producing audible output.
     int64_t skip_until_pts = AV_NOPTS_VALUE;
 
+    constexpr auto kSeekDebounce = std::chrono::milliseconds(250);
+    constexpr double kSeekStepSec = 5.0;
+    bool seek_pending = false;
+    double seek_preview_sec = 0.0;
+    std::chrono::steady_clock::time_point last_seek_key_time{};
+
     while (g_running) {
         int64_t seek_req = g_seek_target.exchange(-1);
         if (seek_req == -4) {
             is_paused = !is_paused;
             writer.pause(is_paused);
         } else if (seek_req == -2 || seek_req == -3) {
-            double offset = (seek_req == -2) ? 5.0 : -5.0;
-            double target_sec = std::max(0.0, current_pos_sec + offset);
+            double offset = (seek_req == -2) ? kSeekStepSec : -kSeekStepSec;
+            double base = seek_pending ? seek_preview_sec : current_pos_sec;
+            seek_preview_sec = std::max(0.0, base + offset);
+            seek_pending = true;
+            last_seek_key_time = std::chrono::steady_clock::now();
+        }
+
+        // Commit the real seek only after the debounce window has elapsed
+        // with no further seek key presses.
+        if (seek_pending && (std::chrono::steady_clock::now() - last_seek_key_time) >= kSeekDebounce) {
+            double target_sec = seek_preview_sec;
             int64_t target_pts = static_cast<int64_t>(target_sec * AV_TIME_BASE);
 
             if (avformat_seek_file(fmt_ctx, -1, INT64_MIN, target_pts, INT64_MAX, 0) >= 0) {
@@ -553,6 +568,13 @@ static int play(const std::string &file_path, const AlsaDevice &dev, bool enable
                  */
                 skip_until_pts = av_rescale_q(target_pts, AV_TIME_BASE_Q, stream->time_base);
             }
+            seek_pending = false;
+        }
+
+        if (seek_pending) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            print_status(seek_preview_sec, duration_sec, g_volume.load());
+            continue;
         }
 
         if (is_paused) {
