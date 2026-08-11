@@ -1,11 +1,13 @@
 #include "Alsa.hpp"
 #include "AnsiColors.hpp"
+#include "DsdPacker.hpp"
 #include "Replaygain.hpp"
 #include "Resampler.hpp"
 #include "SoftwareMixer.hpp"
 #include "TinyAlsa.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -185,6 +187,18 @@ static bool is_dsd_codec(enum AVCodecID codec_id) {
     );
 }
 
+// DSF (*_PLANAR) stores fixed-size per-channel blocks; DSDIFF (non-planar) is byte-interleaved.
+// This is only meaningful for raw DoP / native DSD playback, which never goes through avcodec's
+// dsd_lsbf/dsd_msbf decoder and must reconstruct the layout itself from the raw demuxed bytes.
+static DsdSourceLayout make_dsd_layout(enum AVCodecID codec_id, int channels) {
+    DsdSourceLayout layout;
+    layout.channels = channels > 0 ? channels : 2;
+    layout.msb_first = (codec_id == AV_CODEC_ID_DSD_MSBF || codec_id == AV_CODEC_ID_DSD_MSBF_PLANAR);
+    layout.planar = (codec_id == AV_CODEC_ID_DSD_LSBF_PLANAR || codec_id == AV_CODEC_ID_DSD_MSBF_PLANAR);
+    layout.block_size = 4096; // Sony DSF spec default; ffmpeg's dsf demuxer packages one full block group per packet.
+    return layout;
+}
+
 // ─── Keyboard thread ──────────────────────────────────────────────────────────
 static void keyboard_thread() {
     while (g_running) {
@@ -280,8 +294,362 @@ static void watch_mixer_thread() {
     }
 }
 
+// ─── Raw DSD playback ────────────
+static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, DsdOutputMode mode) {
+    tinyalsa::size_type card = dev.card;
+    tinyalsa::size_type device = dev.device;
+    std::string display_name = dev.name + " [" + dev.hw_id + "]";
+
+    bool hw_mixer_available = init_hw_mixer(card);
+    set_volume(g_volume.load());
+
+    AVFormatContext *fmt_ctx = nullptr;
+    if (avformat_open_input(&fmt_ctx, file_path.c_str(), nullptr, nullptr) < 0) {
+        std::cerr << RED << "ERROR: Cannot open file: " << file_path << RESET << "\n";
+        return 1;
+    }
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+        std::cerr << RED << "ERROR: Cannot find stream info.\n" << RESET;
+        avformat_close_input(&fmt_ctx);
+        return 1;
+    }
+
+    int audio_idx = -1;
+    for (unsigned i = 0; i < fmt_ctx->nb_streams; ++i) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            audio_idx = (int)i;
+            break;
+        }
+    }
+    if (audio_idx < 0) {
+        std::cerr << RED << "ERROR: No audio stream found.\n" << RESET;
+        avformat_close_input(&fmt_ctx);
+        return 1;
+    }
+
+    AVStream *stream = fmt_ctx->streams[audio_idx];
+    AVCodecParameters *codecpar = stream->codecpar;
+    double duration_sec = (stream->duration != AV_NOPTS_VALUE) ? stream->duration * av_q2d(stream->time_base) :
+                                                                 (double)fmt_ctx->duration / AV_TIME_BASE;
+
+    int channels = codecpar->ch_layout.nb_channels > 0 ? codecpar->ch_layout.nb_channels : 2;
+    tinyalsa::size_type dsd_rate = static_cast<tinyalsa::size_type>(codecpar->sample_rate);
+    DsdSourceLayout layout = make_dsd_layout(codecpar->codec_id, channels);
+
+    tinyalsa::pcm_params params;
+    if (params.open(card, device, false).failed()) {
+        std::cerr << RED << "ERROR: Cannot open PCM params for hw:" << card << "," << device << RESET << "\n";
+        avformat_close_input(&fmt_ctx);
+        return 1;
+    }
+
+    tinyalsa::sample_format out_fmt = tinyalsa::sample_format::s24_le;
+    tinyalsa::sample_format native_fmt = tinyalsa::sample_format::dsd_u32_be;
+    bool widen_dop_to_32bit = false;
+
+    if (mode == DsdOutputMode::Native) {
+        DsdOutputMode confirmed = choose_dsd_output_mode(params, dsd_rate, /*allowNative=*/true, /*allowDop=*/false, &native_fmt);
+        if (confirmed != DsdOutputMode::Native) {
+            std::cerr << RED << "ERROR: Device does not support the negotiated DSD configuration.\n" << RESET;
+            params.close();
+            avformat_close_input(&fmt_ctx);
+            return 1;
+        }
+        out_fmt = native_fmt;
+    } else {
+        // dsd_rate is FFmpeg's dsf/dsdiff sample_rate: an already-halved byte rate
+        // (bit rate / 8), so DoP's 2-bytes-per-word packing gives dop_rate = dsd_rate / 2.
+        // See the matching note in DsdPacker.cpp::choose_dsd_output_mode.
+        tinyalsa::size_type dop_rate = dsd_rate / 2;
+        if (params.test_config((tinyalsa::size_type)channels, dop_rate, tinyalsa::sample_format::s24_le)) {
+            out_fmt = tinyalsa::sample_format::s24_le;
+        } else if (params.test_config((tinyalsa::size_type)channels, dop_rate, tinyalsa::sample_format::s32_le)) {
+            out_fmt = tinyalsa::sample_format::s32_le;
+            widen_dop_to_32bit = true;
+        } else {
+            std::cerr << RED << "ERROR: Device does not support the negotiated DSD configuration.\n" << RESET;
+            params.close();
+            avformat_close_input(&fmt_ctx);
+            return 1;
+        }
+    }
+
+    tinyalsa::size_type out_rate = dsd_pcm_rate(mode, dsd_rate, native_fmt);
+    if (!params.test_config((tinyalsa::size_type)channels, out_rate, out_fmt)) {
+        std::cerr << RED << "ERROR: Device does not support the negotiated DSD configuration.\n" << RESET;
+        params.close();
+        avformat_close_input(&fmt_ctx);
+        return 1;
+    }
+
+    tinyalsa::size_type period_size = 1024;
+    auto min_period = params.get_min_period_size();
+    auto max_period = params.get_max_period_size();
+    tinyalsa::size_type period_lo = 32, period_hi = 8192;
+    if (!min_period.failed() && !max_period.failed()) {
+        period_lo = min_period.unwrap();
+        period_hi = max_period.unwrap();
+        period_size = std::clamp(period_size, period_lo, period_hi);
+
+        // Round down to a power of two within range; most drivers prefer this,
+        // and it matches the negotiation used by the regular PCM playback path.
+        tinyalsa::size_type p = 1;
+        while (p * 2 <= period_size) p *= 2;
+        if (p >= period_lo) period_size = p;
+    }
+    params.close();
+
+    tinyalsa::interleaved_pcm_writer writer;
+    if (writer.open(card, device, false).failed()) {
+        std::cerr << RED << "ERROR: Cannot open PCM device hw:" << card << "," << device << RESET << "\n";
+        avformat_close_input(&fmt_ctx);
+        return 1;
+    }
+
+    tinyalsa::pcm_config config;
+    config.channels = (tinyalsa::size_type)channels;
+    config.rate = out_rate;
+    config.format = out_fmt;
+
+    // get_min/max_period_size() above probe the period axis in isolation, not
+    // jointly with the rate/format/channels we just pinned, so the reported range
+    // can still be wrong for this specific combination (seen in practice at
+    // DSD128 DoP's 352.8kHz, where many DACs accept a much narrower period window
+    // than at ordinary PCM rates). Try a descending set of power-of-two period_size
+    // candidates crossed with a few period_count candidates, and let the real
+    // hw_params commit in writer.setup() decide what actually works. period_count
+    // is swept too: a size/count pair can jointly exceed a device's max buffer
+    // time even when period_size alone was reported as in-range.
+    static constexpr std::array<tinyalsa::size_type, 4> kPeriodCountCandidates{4, 8, 3, 2};
+
+    bool configured = false;
+    int last_errno = 0;
+    tinyalsa::size_type last_size = 0;
+    tinyalsa::size_type last_count = 0;
+    bool last_failed_at_prepare = false;
+    for (tinyalsa::size_type count : kPeriodCountCandidates) {
+        config.period_count = count;
+        for (tinyalsa::size_type candidate = period_size; candidate >= 32; candidate /= 2) {
+            if (candidate < period_lo || candidate > period_hi) continue;
+            config.period_size = candidate;
+            last_size = candidate;
+            last_count = count;
+            auto setup_result = writer.setup(config);
+            if (setup_result.failed()) {
+                last_errno = setup_result.error;
+                last_failed_at_prepare = false;
+                continue;
+            }
+            auto prepare_result = writer.prepare();
+            if (prepare_result.failed()) {
+                last_errno = prepare_result.error;
+                last_failed_at_prepare = true;
+                continue;
+            }
+            configured = true;
+            break;
+        }
+        if (configured) break;
+    }
+
+    if (!configured) {
+        std::cerr << RED << "ERROR: PCM configuration failed"
+                  << " (channels=" << channels << " rate=" << out_rate
+                  << " format=" << tinyalsa::to_string(out_fmt)
+                  << ", last tried period_size=" << last_size << " period_count=" << last_count
+                  << ", failed at " << (last_failed_at_prepare ? "prepare" : "hw_params")
+                  << ", errno=" << last_errno << " [" << tinyalsa::get_error_description(last_errno) << "])\n" << RESET;
+        writer.close();
+        avformat_close_input(&fmt_ctx);
+        return 1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        // clang-format off
+        std::cout << "\n"
+                  << BOLD << CYAN
+                  << "╔═════════════════════════════════════════════════════╗\n"
+                  << "║                       Leticia                       ║\n"
+                  << "╚═════════════════════════════════════════════════════╝\n"
+                  << RESET << GREEN << "  File   : " << WHITE << file_path << "\n"
+                  << RESET << GREEN << "  Device : " << WHITE << display_name << "\n"
+                  << RESET << GREEN << "  Mixer  : " << WHITE << (hw_mixer_available ? "Hardware" : "Unavailable (raw DSD passthrough)") << "\n"
+                  << RESET << GREEN << "  Rate   : " << WHITE << out_rate << " Hz  " << channels << " ch  "
+                  << tinyalsa::to_string(out_fmt) << "\n"
+                  << RESET << GREEN << "  Flags  : " << WHITE << "BitPerfect" << (mode == DsdOutputMode::Native ? "NativeDSD" : "DoP") << "\n\n"
+                  << RESET << YELLOW << "  ← / → : Seek   ↑ / ↓ : Volume   SPACE : Pause   q : Quit\n"
+                  << RESET << "\n";
+        // clang-format on
+    }
+
+    std::thread watcher(watch_mixer_thread);
+    std::thread kb(keyboard_thread);
+    watcher.detach();
+
+    DopPacker dop_packer(layout, widen_dop_to_32bit);
+    NativeDsdPacker native_packer(layout, native_fmt);
+    const size_t out_frame_bytes = tinyalsa::bytes_per_frame(out_fmt, (tinyalsa::size_type)channels);
+
+    AVPacket *pkt = av_packet_alloc();
+    std::vector<uint8_t> out_buf;
+    double current_pos_sec = 0.0;
+    bool is_paused = false;
+
+    constexpr auto kSeekDebounce = std::chrono::milliseconds(250);
+    constexpr double kSeekStepSec = 5.0;
+    bool seek_pending = false;
+    double seek_preview_sec = 0.0;
+    std::chrono::steady_clock::time_point last_seek_key_time{};
+    bool device_disconnected_local = false;
+
+    while (g_running) {
+        int64_t seek_req = g_seek_target.exchange(-1);
+        if (seek_req == -4) {
+            is_paused = !is_paused;
+            writer.pause(is_paused);
+        } else if (seek_req == -2 || seek_req == -3) {
+            double offset = (seek_req == -2) ? kSeekStepSec : -kSeekStepSec;
+            double base = seek_pending ? seek_preview_sec : current_pos_sec;
+            seek_preview_sec = std::max(0.0, base + offset);
+            seek_pending = true;
+            last_seek_key_time = std::chrono::steady_clock::now();
+        }
+
+        if (seek_pending && (std::chrono::steady_clock::now() - last_seek_key_time) >= kSeekDebounce) {
+            double target_sec = seek_preview_sec;
+            int64_t target_pts = static_cast<int64_t>(target_sec * AV_TIME_BASE);
+            if (avformat_seek_file(fmt_ctx, -1, INT64_MIN, target_pts, INT64_MAX, 0) >= 0) {
+                writer.prepare();
+                current_pos_sec = target_sec;
+            }
+            seek_pending = false;
+        }
+
+        if (seek_pending) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            print_status(seek_preview_sec, duration_sec, g_volume.load());
+            continue;
+        }
+
+        if (is_paused) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            print_status(current_pos_sec, duration_sec, g_volume.load());
+            continue;
+        }
+
+        if (av_read_frame(fmt_ctx, pkt) < 0) break;
+        if (pkt->stream_index != audio_idx) {
+            av_packet_unref(pkt);
+            continue;
+        }
+
+        size_t needed_frames = layout.planar ? (layout.block_size / 2) : (static_cast<size_t>(pkt->size) / channels / 2);
+        out_buf.resize(needed_frames * out_frame_bytes);
+
+        size_t produced_bytes;
+        if (mode == DsdOutputMode::Native) {
+            produced_bytes = native_packer.pack(pkt->data, (size_t)pkt->size, out_buf.data(), out_buf.size());
+        } else {
+            produced_bytes = dop_packer.pack(
+                pkt->data, (size_t)pkt->size, reinterpret_cast<int32_t *>(out_buf.data()), out_buf.size() / out_frame_bytes
+            ) * out_frame_bytes;
+        }
+
+        if (pkt->pts != AV_NOPTS_VALUE) current_pos_sec = pkt->pts * av_q2d(stream->time_base);
+        av_packet_unref(pkt);
+
+        if (produced_bytes == 0) continue;
+        tinyalsa::size_type total_frames = (tinyalsa::size_type)(produced_bytes / out_frame_bytes);
+        tinyalsa::size_type written = 0;
+
+        while (written < total_frames && g_running) {
+            int64_t sreq = g_seek_target.load();
+            if (sreq != -1) {
+                if (sreq == -4) {
+                    g_seek_target.store(-1);
+                    is_paused = !is_paused;
+                    writer.pause(is_paused);
+                } else {
+                    break;
+                }
+            }
+            if (is_paused) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+
+            auto avail_res = writer.get_avail();
+            if (avail_res.failed()) {
+                tinyalsa::pcm_recover(writer, avail_res.error);
+                if (writer.get_state().unwrap() == tinyalsa::pcm_state::disconnected) {
+                    device_disconnected_local = true;
+                    g_running = false;
+                    break;
+                }
+                continue;
+            }
+
+            tinyalsa::size_type avail = avail_res.unwrap();
+            if (avail == 0) {
+                auto state = writer.get_state().unwrap();
+                if (state == tinyalsa::pcm_state::disconnected) {
+                    device_disconnected_local = true;
+                    g_running = false;
+                    break;
+                } else if (state == tinyalsa::pcm_state::xrun) {
+                    writer.prepare();
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+
+            tinyalsa::size_type to_write = std::min(avail, total_frames - written);
+            auto write_res = writer.write_unformatted(out_buf.data() + written * out_frame_bytes, to_write);
+            if (write_res.failed()) {
+                tinyalsa::pcm_recover(writer, write_res.error);
+                if (writer.get_state().unwrap() == tinyalsa::pcm_state::disconnected) {
+                    device_disconnected_local = true;
+                    g_running = false;
+                    break;
+                }
+            } else {
+                written += write_res.unwrap();
+            }
+        }
+
+        double delay_sec = 0.0;
+        auto delay_res = writer.get_delay();
+        if (!delay_res.failed()) delay_sec = (double)delay_res.unwrap() / out_rate;
+        print_status(std::max(0.0, current_pos_sec - delay_sec), duration_sec, g_volume.load());
+    }
+
+    g_running = false;
+    if (kb.joinable()) kb.join();
+
+    {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        std::cout << "\r\033[K" << std::flush;
+    }
+
+    av_packet_free(&pkt);
+    writer.close();
+    avformat_close_input(&fmt_ctx);
+    cleanup_hw_mixer();
+
+    if (device_disconnected_local) {
+        std::cout << RED << BOLD << "ERROR: Audio device was disconnected\n" << RESET;
+        return 2;
+    }
+    std::cout << GREEN << "Playback finished.\n" << RESET;
+    return 0;
+}
+
 // ─── Core playback ────────────────────────────────────────────────────────────
-static int play(const std::string &file_path, const AlsaDevice &dev, bool enable_replaygain, bool force_software_mixer) {
+static int play(
+    const std::string &file_path, const AlsaDevice &dev, bool enable_replaygain, bool force_software_mixer,
+    bool allow_native_dsd, bool allow_dop
+) {
     tinyalsa::size_type card = dev.card;
     tinyalsa::size_type device = dev.device;
     std::string display_name = dev.name + " [" + dev.hw_id + "]";
@@ -343,6 +711,24 @@ static int play(const std::string &file_path, const AlsaDevice &dev, bool enable
     int in_rate = codec_ctx->sample_rate ? codec_ctx->sample_rate : 44100;
     int out_rate = in_rate;
     int out_channels = 2;
+
+    // DoP / native DSD bypass FFmpeg's software DSD-to-PCM decode entirely, so the
+    // decision has to happen before any of that setup runs, and control hands off
+    // to a dedicated raw playback path if the device can take the bitstream as-is.
+    if (dsd_mode && (allow_native_dsd || allow_dop)) {
+        tinyalsa::pcm_params probe;
+        if (!probe.open(card, device, false).failed()) {
+            tinyalsa::size_type dsd_rate = (tinyalsa::size_type)in_rate;
+            DsdOutputMode mode = choose_dsd_output_mode(probe, dsd_rate, allow_native_dsd, allow_dop);
+            probe.close();
+
+            if (mode != DsdOutputMode::Pcm) {
+                avcodec_free_context(&codec_ctx);
+                avformat_close_input(&fmt_ctx);
+                return play_dsd_raw(file_path, dev, mode);
+            }
+        }
+    }
 
     // ─── Replaygain (optional) ──────────────────────────────
     float replaygain_mult = 1.0f;
@@ -760,17 +1146,31 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc < 2) {
-        std::cerr << YELLOW << "Usage: " << argv[0] << " <file> [hw:card,device] [--replaygain] [--software-mixer]\n" << RESET;
+        std::cerr << YELLOW
+                  << "Usage: " << argv[0]
+                  << " <file> [hw:card,device] [--replaygain] [--software-mixer] [--dop] [--native-dsd] [--pcm-only]\n"
+                  << RESET;
         return 1;
     }
 
     std::string file_path = argv[1];
     bool enable_replaygain = false;
     bool force_software_mixer = false;
+    bool force_dop = false;
+    bool force_native_dsd = false;
+    bool pcm_only = false;
     for (int i = 2; i < argc; ++i) {
         if (std::string(argv[i]) == "--replaygain") enable_replaygain = true;
         if (std::string(argv[i]) == "--software-mixer") force_software_mixer = true;
+        if (std::string(argv[i]) == "--dop") force_dop = true;
+        if (std::string(argv[i]) == "--native-dsd") force_native_dsd = true;
+        if (std::string(argv[i]) == "--pcm-only") pcm_only = true;
     }
+
+    // Default: try native DSD first, fall back to DoP, then to software PCM conversion.
+    // --dop / --native-dsd narrow that to a single strategy; --pcm-only disables both.
+    bool allow_native_dsd = !pcm_only && !force_dop;
+    bool allow_dop = !pcm_only && !force_native_dsd;
 
     AlsaDevice dev;
     if (argc >= 3 && std::string(argv[2]).find("hw:") == 0) {
@@ -810,5 +1210,5 @@ int main(int argc, char *argv[]) {
     RawTerminal raw;
     raw.enable();
 
-    return play(file_path, dev, enable_replaygain, force_software_mixer);
+    return play(file_path, dev, enable_replaygain, force_software_mixer, allow_native_dsd, allow_dop);
 }

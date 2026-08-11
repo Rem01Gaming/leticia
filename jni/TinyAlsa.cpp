@@ -210,6 +210,11 @@ constexpr int to_alsa_format(sample_format sf) noexcept {
         case sample_format::s24_be: return SNDRV_PCM_FORMAT_S24_BE;
         case sample_format::s32_le: return SNDRV_PCM_FORMAT_S32_LE;
         case sample_format::s32_be: return SNDRV_PCM_FORMAT_S32_BE;
+        case sample_format::dsd_u8: return SNDRV_PCM_FORMAT_DSD_U8;
+        case sample_format::dsd_u16_le: return SNDRV_PCM_FORMAT_DSD_U16_LE;
+        case sample_format::dsd_u16_be: return SNDRV_PCM_FORMAT_DSD_U16_BE;
+        case sample_format::dsd_u32_le: return SNDRV_PCM_FORMAT_DSD_U32_LE;
+        case sample_format::dsd_u32_be: return SNDRV_PCM_FORMAT_DSD_U32_BE;
     }
     return 0;
 }
@@ -312,6 +317,11 @@ const char *to_string(sample_format sf) noexcept {
         case sample_format::u24_be: return "U24_BE";
         case sample_format::u32_le: return "U32_LE";
         case sample_format::u32_be: return "U32_BE";
+        case sample_format::dsd_u8: return "DSD_U8";
+        case sample_format::dsd_u16_le: return "DSD_U16_LE";
+        case sample_format::dsd_u16_be: return "DSD_U16_BE";
+        case sample_format::dsd_u32_le: return "DSD_U32_LE";
+        case sample_format::dsd_u32_be: return "DSD_U32_BE";
     }
     return "UNKNOWN";
 }
@@ -348,6 +358,14 @@ size_type bytes_per_frame(sample_format fmt, size_type channels) noexcept {
         case sample_format::s32_be:
         case sample_format::u32_le:
         case sample_format::u32_be: bps = 4; break;
+
+        case sample_format::dsd_u8: bps = 1; break;
+
+        case sample_format::dsd_u16_le:
+        case sample_format::dsd_u16_be: bps = 2; break;
+
+        case sample_format::dsd_u32_le:
+        case sample_format::dsd_u32_be: bps = 4; break;
     }
     return bps * channels;
 }
@@ -1051,6 +1069,7 @@ bool pcm_params::test_format(sample_format fmt) const noexcept {
     if (!is_open()) return false;
     auto test = self->params;
     mask_ref<SNDRV_PCM_HW_PARAM_FORMAT>::set(test, to_alsa_format(fmt));
+    test.rmask = ~0U;
     return ioctl(self->fd, SNDRV_PCM_IOCTL_HW_REFINE, &test) >= 0;
 }
 
@@ -1058,6 +1077,7 @@ bool pcm_params::test_rate(size_type rate) const noexcept {
     if (!is_open()) return false;
     auto test = self->params;
     interval_ref<SNDRV_PCM_HW_PARAM_RATE>::set(test, rate);
+    test.rmask = ~0U;
     return ioctl(self->fd, SNDRV_PCM_IOCTL_HW_REFINE, &test) >= 0;
 }
 
@@ -1065,6 +1085,17 @@ bool pcm_params::test_channels(size_type ch) const noexcept {
     if (!is_open()) return false;
     auto test = self->params;
     interval_ref<SNDRV_PCM_HW_PARAM_CHANNELS>::set(test, ch);
+    test.rmask = ~0U;
+    return ioctl(self->fd, SNDRV_PCM_IOCTL_HW_REFINE, &test) >= 0;
+}
+
+bool pcm_params::test_config(size_type channels, size_type rate, sample_format fmt) const noexcept {
+    if (!is_open()) return false;
+    auto test = self->params;
+    interval_ref<SNDRV_PCM_HW_PARAM_CHANNELS>::set(test, channels);
+    interval_ref<SNDRV_PCM_HW_PARAM_RATE>::set(test, rate);
+    mask_ref<SNDRV_PCM_HW_PARAM_FORMAT>::set(test, to_alsa_format(fmt));
+    test.rmask = ~0U;
     return ioctl(self->fd, SNDRV_PCM_IOCTL_HW_REFINE, &test) >= 0;
 }
 
@@ -1072,6 +1103,7 @@ bool pcm_params::test_period_size(size_type ps) const noexcept {
     if (!is_open()) return false;
     auto test = self->params;
     interval_ref<SNDRV_PCM_HW_PARAM_PERIOD_SIZE>::set(test, ps);
+    test.rmask = ~0U;
     return ioctl(self->fd, SNDRV_PCM_IOCTL_HW_REFINE, &test) >= 0;
 }
 
@@ -1079,6 +1111,7 @@ bool pcm_params::test_period_count(size_type pc) const noexcept {
     if (!is_open()) return false;
     auto test = self->params;
     interval_ref<SNDRV_PCM_HW_PARAM_PERIODS>::set(test, pc);
+    test.rmask = ~0U;
     return ioctl(self->fd, SNDRV_PCM_IOCTL_HW_REFINE, &test) >= 0;
 }
 
@@ -1091,13 +1124,15 @@ void pcm_params::for_each_supported_format(void (*callback)(sample_format, void 
         sample_format::s24_be,  sample_format::s32_le,  sample_format::s32_be,  sample_format::u8,      sample_format::u16_le,
         sample_format::u16_be,  sample_format::u18_3le, sample_format::u18_3be, sample_format::u20_3le, sample_format::u20_3be,
         sample_format::u24_3le, sample_format::u24_3be, sample_format::u24_le,  sample_format::u24_be,  sample_format::u32_le,
-        sample_format::u32_be,
+        sample_format::u32_be,  sample_format::dsd_u8,  sample_format::dsd_u16_le, sample_format::dsd_u16_be, sample_format::dsd_u32_le,
+        sample_format::dsd_u32_be,
     };
 
     for (auto fmt : all_formats) {
         // Use the already-refined params as a starting mask and pin only FORMAT.
         auto test = self->params;
         mask_ref<SNDRV_PCM_HW_PARAM_FORMAT>::set(test, to_alsa_format(fmt));
+        test.rmask = ~0U;
         if (ioctl(self->fd, SNDRV_PCM_IOCTL_HW_REFINE, &test) >= 0) callback(fmt, user_data);
     }
 }

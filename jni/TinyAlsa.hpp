@@ -107,7 +107,12 @@ enum class sample_format {
     u24_le,
     u24_be,
     u32_le,
-    u32_be
+    u32_be,
+    dsd_u8,
+    dsd_u16_le,
+    dsd_u16_be,
+    dsd_u32_le,
+    dsd_u32_be
 };
 
 // ============================================================================
@@ -120,11 +125,14 @@ namespace detail {
  * @brief CRTP base providing compile-time traits for a sample format.
  *
  * @tparam IsSigned       Whether the format is signed.
- * @tparam BitDepth       Significant bits (e.g. 24 for S24_LE).
+ * @tparam BitDepth       Significant bits (e.g. 24 for S24_LE). For DSD formats this is the
+ *                         number of packed 1-bit samples per container (= ContainerBytes * 8),
+ *                         not a PCM signal resolution.
  * @tparam ContainerBytes Storage bytes per sample (e.g. 4 for S24_LE, 3 for S24_3LE).
  * @tparam LittleEndian   Byte order. For 8-bit formats @c true is returned by convention.
+ * @tparam IsDsd          Whether the format is a DSD bitstream rather than linear PCM.
  */
-template <bool IsSigned, int BitDepth, int ContainerBytes, bool LittleEndian>
+template <bool IsSigned, int BitDepth, int ContainerBytes, bool LittleEndian, bool IsDsd = false>
 struct sample_traits_base {
     static constexpr bool is_signed() noexcept {
         return IsSigned;
@@ -137,6 +145,9 @@ struct sample_traits_base {
     }
     static constexpr bool is_little_endian() noexcept {
         return LittleEndian;
+    }
+    static constexpr bool is_dsd() noexcept {
+        return IsDsd;
     }
 };
 
@@ -214,6 +225,18 @@ struct sample_traits<sample_format::u32_le> final : detail::sample_traits_base<f
 template <>
 struct sample_traits<sample_format::u32_be> final : detail::sample_traits_base<false, 32, 4, false> {};
 
+// DSD bitstream formats (1 bit per sample, packed into the container)
+template <>
+struct sample_traits<sample_format::dsd_u8> final : detail::sample_traits_base<false, 8, 1, true, true> {};
+template <>
+struct sample_traits<sample_format::dsd_u16_le> final : detail::sample_traits_base<false, 16, 2, true, true> {};
+template <>
+struct sample_traits<sample_format::dsd_u16_be> final : detail::sample_traits_base<false, 16, 2, false, true> {};
+template <>
+struct sample_traits<sample_format::dsd_u32_le> final : detail::sample_traits_base<false, 32, 4, true, true> {};
+template <>
+struct sample_traits<sample_format::dsd_u32_be> final : detail::sample_traits_base<false, 32, 4, false, true> {};
+
 /**
  * @brief Returns the number of bytes required to hold one audio frame.
  * @param fmt      The sample format.
@@ -224,9 +247,23 @@ size_type bytes_per_frame(sample_format fmt, size_type channels) noexcept;
 
 /**
  * @brief Returns the ALSA string representation of a @ref sample_format value.
- * @return e.g. @c "S16_LE", @c "U24_3BE", or @c "UNKNOWN".
+ * @return e.g. @c "S16_LE", @c "U24_3BE", @c "DSD_U32_LE", or @c "UNKNOWN".
  */
 const char *to_string(sample_format sf) noexcept;
+
+/**
+ * @brief Returns true if @p fmt is a DSD bitstream format rather than linear PCM.
+ */
+constexpr bool is_dsd(sample_format fmt) noexcept {
+    switch (fmt) {
+        case sample_format::dsd_u8:
+        case sample_format::dsd_u16_le:
+        case sample_format::dsd_u16_be:
+        case sample_format::dsd_u32_le:
+        case sample_format::dsd_u32_be: return true;
+        default: return false;
+    }
+}
 
 // ============================================================================
 // sample_access
@@ -578,6 +615,18 @@ public:
     bool test_channels(size_type ch) const noexcept;
     bool test_period_size(size_type ps) const noexcept;
     bool test_period_count(size_type pc) const noexcept;
+
+    /**
+     * @brief Tests whether channels, rate, and format are all achievable together
+     * in a single hw_params refine, rather than the three independently.
+     * @note test_format()/test_rate()/test_channels() each refine only one axis
+     * against the full device capability baseline, so a device that restricts a
+     * format to certain rates (or vice versa) can pass each test individually
+     * while the combination is not actually supported. This method is the
+     * authoritative check for "would hw_params accept these three together" and
+     * should be preferred whenever more than one axis is being pinned at once.
+     */
+    bool test_config(size_type channels, size_type rate, sample_format fmt) const noexcept;
 
     /**
      * @brief Iterates over every sample format the device actually supports.

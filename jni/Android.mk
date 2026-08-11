@@ -4,20 +4,14 @@ include $(CLEAR_VARS)
 
 LOCAL_MODULE := leticia
 
-LOCAL_SRC_FILES := \
-	Main.cpp \
-	Alsa.cpp \
-	Resampler.cpp \
-	SoftwareMixer.cpp \
-	Replaygain.cpp \
-	TinyAlsa.cpp
+LOCAL_SRC_FILES := $(wildcard $(LOCAL_PATH)/*.cpp)
+LOCAL_SRC_FILES := $(LOCAL_SRC_FILES:$(LOCAL_PATH)/%=%)
 
 LOCAL_C_INCLUDES := $(LOCAL_PATH)/FFmpeg/include
 
-LOCAL_CFLAGS := -std=c++23 -O2 -fPIE -fPIC -flto
+LLOCAL_CFLAGS := -std=c++23 -g -O0 -fPIE -fPIC
 LOCAL_CPPFLAGS := -Wpedantic -Wall -Wextra -Werror -Wformat -Wuninitialized
-
-LOCAL_LDFLAGS := -fPIE -fPIC -Wl,-z,max-page-size=16384 -flto
+LOCAL_LDFLAGS := -fPIE -fPIC -Wl,-z,max-page-size=16384
 LOCAL_LDLIBS := -lz -lm
 
 LOCAL_STATIC_LIBRARIES := avformat avcodec swresample avutil
