@@ -382,7 +382,7 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
         return 1;
     }
 
-    tinyalsa::size_type period_size = 1024;
+    tinyalsa::size_type period_size = (out_rate >= 176400) ? 4096 : 1024;
     auto min_period = params.get_min_period_size();
     auto max_period = params.get_max_period_size();
     tinyalsa::size_type period_lo = 32, period_hi = 8192;
@@ -411,16 +411,7 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
     config.rate = out_rate;
     config.format = out_fmt;
 
-    // get_min/max_period_size() above probe the period axis in isolation, not
-    // jointly with the rate/format/channels we just pinned, so the reported range
-    // can still be wrong for this specific combination (seen in practice at
-    // DSD128 DoP's 352.8kHz, where many DACs accept a much narrower period window
-    // than at ordinary PCM rates). Try a descending set of power-of-two period_size
-    // candidates crossed with a few period_count candidates, and let the real
-    // hw_params commit in writer.setup() decide what actually works. period_count
-    // is swept too: a size/count pair can jointly exceed a device's max buffer
-    // time even when period_size alone was reported as in-range.
-    static constexpr std::array<tinyalsa::size_type, 4> kPeriodCountCandidates{4, 8, 3, 2};
+    static constexpr std::array<tinyalsa::size_type, 4> kPeriodCountCandidates{8, 4, 3, 2};
 
     bool configured = false;
     int last_errno = 0;
@@ -503,6 +494,15 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
     std::chrono::steady_clock::time_point last_seek_key_time{};
     bool device_disconnected_local = false;
 
+    // Pre-roll discard threshold: after a seek, packets with pts below this
+    // value are discarded to allow the demuxer to stabilize and avoid sending
+    // partial/misaligned DSD data that causes glitches.
+    int64_t skip_until_pts = AV_NOPTS_VALUE;
+
+    // Track if we're in the immediate post-seek period where we need to flush
+    // the ALSA hardware buffer to prevent stale/corrupt audio from playing.
+    bool post_seek_flush_pending = false;
+
     while (g_running) {
         int64_t seek_req = g_seek_target.exchange(-1);
         if (seek_req == -4) {
@@ -521,7 +521,19 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
             int64_t target_pts = static_cast<int64_t>(target_sec * AV_TIME_BASE);
             if (avformat_seek_file(fmt_ctx, -1, INT64_MIN, target_pts, INT64_MAX, 0) >= 0) {
                 writer.prepare();
+                // Reset DoP marker state to prevent glitch on resume after seek
+                if (mode != DsdOutputMode::Native) {
+                    dop_packer.reset();
+                }
                 current_pos_sec = target_sec;
+
+                /*
+                 * Convert the seek target into the stream's time_base so we can
+                 * compare against packet pts. The first few packets after a seek
+                 * may be partial or misaligned; discard them to avoid glitches.
+                 */
+                skip_until_pts = av_rescale_q(target_pts, AV_TIME_BASE_Q, stream->time_base);
+                post_seek_flush_pending = true;
             }
             seek_pending = false;
         }
@@ -544,7 +556,35 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
             continue;
         }
 
-        size_t needed_frames = layout.planar ? (layout.block_size / 2) : (static_cast<size_t>(pkt->size) / channels / 2);
+        // Discard packets with pts below skip_until_pts after a seek to avoid
+        // sending partial/misaligned DSD data that causes glitches.
+        if (skip_until_pts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE) {
+            if (pkt->pts < skip_until_pts) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            skip_until_pts = AV_NOPTS_VALUE;
+            post_seek_flush_pending = true;
+        }
+
+        size_t needed_frames = 0;
+
+        if (mode == DsdOutputMode::Native) {
+            const size_t containerBytes =
+                static_cast<size_t>(tinyalsa::bytes_per_frame(native_fmt, 1));
+
+            if (containerBytes == 0) {
+                av_packet_unref(pkt);
+                continue;
+            }
+
+            needed_frames = layout.planar
+                ? (layout.block_size / containerBytes)
+                : (static_cast<size_t>(pkt->size) / static_cast<size_t>(channels) / containerBytes);
+        } else {
+            needed_frames = dop_packer.max_output_frames_for(static_cast<size_t>(pkt->size));
+        }
+
         out_buf.resize(needed_frames * out_frame_bytes);
 
         size_t produced_bytes;
@@ -604,6 +644,20 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
                 continue;
             }
 
+            // After a seek, discard the first buffer worth of audio to ensure
+            // clean playback start and avoid residual stale data.
+            if (post_seek_flush_pending) {
+                post_seek_flush_pending = false;
+                writer.prepare();
+
+                if (mode != DsdOutputMode::Native) {
+                    dop_packer.reset();
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
             tinyalsa::size_type to_write = std::min(avail, total_frames - written);
             auto write_res = writer.write_unformatted(out_buf.data() + written * out_frame_bytes, to_write);
             if (write_res.failed()) {
@@ -637,7 +691,8 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
     avformat_close_input(&fmt_ctx);
     cleanup_hw_mixer();
 
-    if (device_disconnected_local) {
+    if (device_disconnected_local || g_device_disconnected) {
+        g_device_disconnected = true;
         std::cout << RED << BOLD << "ERROR: Audio device was disconnected\n" << RESET;
         return 2;
     }

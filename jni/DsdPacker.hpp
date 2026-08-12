@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 /**
  * @brief Output strategy for a DSD source.
@@ -93,6 +94,19 @@ public:
     explicit DopPacker(const DsdSourceLayout &layout, bool wideningTo32Bit = false);
 
     /**
+     * @brief Resets the DoP marker state. Call this after a seek to prevent
+     * audio glitches caused by marker phase misalignment.
+     */
+    void reset();
+
+    /**
+     * @brief Returns the maximum number of output frames that could be produced
+     *        if @p inBytes additional input bytes are appended to the internal
+     *        carry-over buffer.
+     */
+    size_t max_output_frames_for(size_t inBytes) const;
+
+    /**
      * @brief Packs one full demuxed packet (or one planar block group) of raw DSD bytes.
      * @param in                Raw packet bytes exactly as read from the demuxer.
      * @param inBytes           Size of @p in in bytes.
@@ -106,6 +120,7 @@ private:
     DsdSourceLayout layout_;
     bool widening_;
     bool markerOdd_ = true;
+    std::vector<uint8_t> pending_;
 };
 
 // ============================================================================
