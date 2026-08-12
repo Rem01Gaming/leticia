@@ -93,6 +93,12 @@ public:
     explicit DopPacker(const DsdSourceLayout &layout, bool wideningTo32Bit = false);
 
     /**
+     * @brief Resets the DoP marker state. Call this after a seek to prevent
+     * audio glitches caused by marker phase misalignment.
+     */
+    void reset();
+
+    /**
      * @brief Packs one full demuxed packet (or one planar block group) of raw DSD bytes.
      * @param in                Raw packet bytes exactly as read from the demuxer.
      * @param inBytes           Size of @p in in bytes.

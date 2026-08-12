@@ -94,6 +94,10 @@ tinyalsa::size_type dsd_pcm_rate(DsdOutputMode mode, tinyalsa::size_type dsdRate
 DopPacker::DopPacker(const DsdSourceLayout &layout, bool wideningTo32Bit) : layout_(layout), widening_(wideningTo32Bit) {
 }
 
+void DopPacker::reset() {
+    markerOdd_ = true;
+}
+
 size_t DopPacker::pack(const uint8_t *in, size_t inBytes, int32_t *out, size_t outCapacityFrames) {
     const int channels = layout_.channels;
 

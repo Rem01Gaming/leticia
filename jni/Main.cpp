@@ -503,6 +503,11 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
     std::chrono::steady_clock::time_point last_seek_key_time{};
     bool device_disconnected_local = false;
 
+    // Pre-roll discard threshold: after a seek, packets with pts below this
+    // value are discarded to allow the demuxer to stabilize and avoid sending
+    // partial/misaligned DSD data that causes glitches.
+    int64_t skip_until_pts = AV_NOPTS_VALUE;
+
     while (g_running) {
         int64_t seek_req = g_seek_target.exchange(-1);
         if (seek_req == -4) {
@@ -521,7 +526,18 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
             int64_t target_pts = static_cast<int64_t>(target_sec * AV_TIME_BASE);
             if (avformat_seek_file(fmt_ctx, -1, INT64_MIN, target_pts, INT64_MAX, 0) >= 0) {
                 writer.prepare();
+                // Reset DoP marker state to prevent glitch on resume after seek
+                if (mode != DsdOutputMode::Native) {
+                    dop_packer.reset();
+                }
                 current_pos_sec = target_sec;
+
+                /*
+                 * Convert the seek target into the stream's time_base so we can
+                 * compare against packet pts. The first few packets after a seek
+                 * may be partial or misaligned; discard them to avoid glitches.
+                 */
+                skip_until_pts = av_rescale_q(target_pts, AV_TIME_BASE_Q, stream->time_base);
             }
             seek_pending = false;
         }
@@ -542,6 +558,16 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
         if (pkt->stream_index != audio_idx) {
             av_packet_unref(pkt);
             continue;
+        }
+
+        // Discard packets with pts below skip_until_pts after a seek to avoid
+        // sending partial/misaligned DSD data that causes glitches.
+        if (skip_until_pts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE) {
+            if (pkt->pts < skip_until_pts) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            skip_until_pts = AV_NOPTS_VALUE;
         }
 
         size_t needed_frames = layout.planar ? (layout.block_size / 2) : (static_cast<size_t>(pkt->size) / channels / 2);
@@ -598,6 +624,10 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
                     g_running = false;
                     break;
                 } else if (state == tinyalsa::pcm_state::xrun) {
+                    // Reset DoP marker state on xrun recovery to prevent glitches
+                    if (mode != DsdOutputMode::Native) {
+                        dop_packer.reset();
+                    }
                     writer.prepare();
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
