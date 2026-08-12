@@ -2,12 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <vector>
 
 namespace {
 
-constexpr int32_t kDopMarkerOdd = 0x00050000;
-constexpr int32_t kDopMarkerEven = 0xFFFA0000;
+constexpr uint32_t kDopMarkerOdd = 0x05u << 16;
+constexpr uint32_t kDopMarkerEven = 0xFAu << 16;
 
 uint8_t reverse8(uint8_t x) {
     x = static_cast<uint8_t>(((x & 0xF0) >> 4) | ((x & 0x0F) << 4));
@@ -28,13 +29,19 @@ bool is_le_dsd_format(tinyalsa::sample_format fmt) {
 } // namespace
 
 DsdOutputMode choose_dsd_output_mode(
-    const tinyalsa::pcm_params &params, tinyalsa::size_type dsdRate, bool allowNative, bool allowDop,
+    const tinyalsa::pcm_params &params,
+    tinyalsa::size_type dsdRate,
+    bool allowNative,
+    bool allowDop,
     tinyalsa::sample_format *outNativeFmt
 ) {
     if (allowNative) {
         constexpr std::array<tinyalsa::sample_format, 5> nativeFmts{
-            tinyalsa::sample_format::dsd_u32_be, tinyalsa::sample_format::dsd_u32_le, tinyalsa::sample_format::dsd_u16_be,
-            tinyalsa::sample_format::dsd_u16_le, tinyalsa::sample_format::dsd_u8
+            tinyalsa::sample_format::dsd_u32_be,
+            tinyalsa::sample_format::dsd_u32_le,
+            tinyalsa::sample_format::dsd_u16_be,
+            tinyalsa::sample_format::dsd_u16_le,
+            tinyalsa::sample_format::dsd_u8
         };
 
         for (auto fmt : nativeFmts) {
@@ -66,13 +73,17 @@ DsdOutputMode choose_dsd_output_mode(
 
 tinyalsa::sample_format pick_native_dsd_format(const tinyalsa::pcm_params &params) {
     constexpr std::array<tinyalsa::sample_format, 5> nativeFmts{
-        tinyalsa::sample_format::dsd_u32_be, tinyalsa::sample_format::dsd_u32_le, tinyalsa::sample_format::dsd_u16_be,
-        tinyalsa::sample_format::dsd_u16_le, tinyalsa::sample_format::dsd_u8
+        tinyalsa::sample_format::dsd_u32_be,
+        tinyalsa::sample_format::dsd_u32_le,
+        tinyalsa::sample_format::dsd_u16_be,
+        tinyalsa::sample_format::dsd_u16_le,
+        tinyalsa::sample_format::dsd_u8
     };
 
     for (auto fmt : nativeFmts) {
         if (params.test_format(fmt)) return fmt;
     }
+
     return tinyalsa::sample_format::dsd_u8;
 }
 
@@ -91,20 +102,48 @@ tinyalsa::size_type dsd_pcm_rate(DsdOutputMode mode, tinyalsa::size_type dsdRate
 // DopPacker
 // ============================================================================
 
-DopPacker::DopPacker(const DsdSourceLayout &layout, bool wideningTo32Bit) : layout_(layout), widening_(wideningTo32Bit) {
+DopPacker::DopPacker(const DsdSourceLayout &layout, bool wideningTo32Bit)
+    : layout_(layout)
+    , widening_(wideningTo32Bit) {
 }
 
 size_t DopPacker::pack(const uint8_t *in, size_t inBytes, int32_t *out, size_t outCapacityFrames) {
     const int channels = layout_.channels;
 
     auto emit = [&](uint8_t older, uint8_t newer, size_t frame, int channel) {
-        if (layout_.msb_first) {
+        // Common DoP convention: the 16-bit DSD field is MSB-first.
+        // Therefore LSB-first sources, e.g. DSF, need bit reversal.
+        //
+        // If a particular DAC uses the opposite convention, invert this condition.
+        if (!layout_.msb_first) {
             older = reverse8(older);
             newer = reverse8(newer);
         }
-        int32_t marker = markerOdd_ ? kDopMarkerOdd : kDopMarkerEven;
-        int32_t sample = marker | (static_cast<int32_t>(older) << 8) | static_cast<int32_t>(newer);
-        if (widening_) sample <<= 8;
+
+        uint32_t marker = markerOdd_ ? kDopMarkerOdd : kDopMarkerEven;
+
+        uint32_t word24 = marker | (static_cast<uint32_t>(older) << 8) | static_cast<uint32_t>(newer);
+
+        uint32_t word32;
+
+        if (widening_) {
+            // S32_LE container: left-justify the 24-bit DoP word.
+            word32 = word24 << 8;
+        } else {
+            // S24_LE container: keep the 24-bit word in the low 24 bits.
+            //
+            // Most DoP receivers only care about the low 24 bits. If a specific
+            // driver/DAC requires sign-extended 24-bit values, you can replace
+            // this with:
+            //
+            // word32 = static_cast<uint32_t>(
+            //     static_cast<int32_t>(word24 << 8) >> 8
+            // );
+            word32 = word24;
+        }
+
+        int32_t sample;
+        std::memcpy(&sample, &word32, sizeof(sample));
         out[frame * channels + channel] = sample;
     };
 
@@ -143,7 +182,9 @@ size_t DopPacker::pack(const uint8_t *in, size_t inBytes, int32_t *out, size_t o
 // NativeDsdPacker
 // ============================================================================
 
-NativeDsdPacker::NativeDsdPacker(const DsdSourceLayout &layout, tinyalsa::sample_format target) : layout_(layout), target_(target) {
+NativeDsdPacker::NativeDsdPacker(const DsdSourceLayout &layout, tinyalsa::sample_format target)
+    : layout_(layout)
+    , target_(target) {
 }
 
 size_t NativeDsdPacker::pack(const uint8_t *in, size_t inBytes, uint8_t *out, size_t outCapacityBytes) {

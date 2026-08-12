@@ -477,7 +477,7 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
                   << RESET << GREEN << "  Mixer  : " << WHITE << (hw_mixer_available ? "Hardware" : "Unavailable (raw DSD passthrough)") << "\n"
                   << RESET << GREEN << "  Rate   : " << WHITE << out_rate << " Hz  " << channels << " ch  "
                   << tinyalsa::to_string(out_fmt) << "\n"
-                  << RESET << GREEN << "  Flags  : " << WHITE << "BitPerfect" << (mode == DsdOutputMode::Native ? "NativeDSD" : "DoP") << "\n\n"
+                  << RESET << GREEN << "  Flags  : " << WHITE << "BitPerfect " << (mode == DsdOutputMode::Native ? "NativeDSD" : "DoP") << "\n\n"
                   << RESET << YELLOW << "  ← / → : Seek   ↑ / ↓ : Volume   SPACE : Pause   q : Quit\n"
                   << RESET << "\n";
         // clang-format on
