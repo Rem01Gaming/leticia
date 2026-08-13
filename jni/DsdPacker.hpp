@@ -155,4 +155,5 @@ public:
 private:
     DsdSourceLayout layout_;
     tinyalsa::sample_format target_;
+    std::vector<uint8_t> scratch_;
 };
