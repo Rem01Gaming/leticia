@@ -8,12 +8,20 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sound/asound.h>
+#include <sound/tlv.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define UNLIKELY(cond) __builtin_expect(!!(cond), 0)
+#else
+#define UNLIKELY(cond) (cond)
+#endif
 
 namespace tinyalsa {
 
@@ -180,6 +188,96 @@ pcm_state to_tinyalsa_state(snd_pcm_state_t s) noexcept {
 
 } // namespace
 
+// ============================================================================
+// channel_position
+// ============================================================================
+
+channel_position to_channel_position(unsigned int raw_chmap_value) noexcept {
+    switch (raw_chmap_value & SNDRV_CHMAP_POSITION_MASK) {
+        case SNDRV_CHMAP_NA: return channel_position::na;
+        case SNDRV_CHMAP_MONO: return channel_position::mono;
+        case SNDRV_CHMAP_FL: return channel_position::front_left;
+        case SNDRV_CHMAP_FR: return channel_position::front_right;
+        case SNDRV_CHMAP_RL: return channel_position::rear_left;
+        case SNDRV_CHMAP_RR: return channel_position::rear_right;
+        case SNDRV_CHMAP_FC: return channel_position::front_center;
+        case SNDRV_CHMAP_LFE: return channel_position::lfe;
+        case SNDRV_CHMAP_SL: return channel_position::side_left;
+        case SNDRV_CHMAP_SR: return channel_position::side_right;
+        case SNDRV_CHMAP_RC: return channel_position::rear_center;
+        case SNDRV_CHMAP_FLC: return channel_position::front_left_center;
+        case SNDRV_CHMAP_FRC: return channel_position::front_right_center;
+        case SNDRV_CHMAP_RLC: return channel_position::rear_left_center;
+        case SNDRV_CHMAP_RRC: return channel_position::rear_right_center;
+        case SNDRV_CHMAP_FLW: return channel_position::front_left_wide;
+        case SNDRV_CHMAP_FRW: return channel_position::front_right_wide;
+        case SNDRV_CHMAP_FLH: return channel_position::front_left_high;
+        case SNDRV_CHMAP_FCH: return channel_position::front_center_high;
+        case SNDRV_CHMAP_FRH: return channel_position::front_right_high;
+        case SNDRV_CHMAP_TC: return channel_position::top_center;
+        case SNDRV_CHMAP_TFL: return channel_position::top_front_left;
+        case SNDRV_CHMAP_TFR: return channel_position::top_front_right;
+        case SNDRV_CHMAP_TFC: return channel_position::top_front_center;
+        case SNDRV_CHMAP_TRL: return channel_position::top_rear_left;
+        case SNDRV_CHMAP_TRR: return channel_position::top_rear_right;
+        case SNDRV_CHMAP_TRC: return channel_position::top_rear_center;
+        case SNDRV_CHMAP_TFLC: return channel_position::top_front_left_center;
+        case SNDRV_CHMAP_TFRC: return channel_position::top_front_right_center;
+        case SNDRV_CHMAP_TSL: return channel_position::top_side_left;
+        case SNDRV_CHMAP_TSR: return channel_position::top_side_right;
+        case SNDRV_CHMAP_LLFE: return channel_position::left_lfe;
+        case SNDRV_CHMAP_RLFE: return channel_position::right_lfe;
+        case SNDRV_CHMAP_BC: return channel_position::bottom_center;
+        case SNDRV_CHMAP_BLC: return channel_position::bottom_left_center;
+        case SNDRV_CHMAP_BRC: return channel_position::bottom_right_center;
+        default: break;
+    }
+    return channel_position::unknown;
+}
+
+const char *to_string(channel_position pos) noexcept {
+    switch (pos) {
+        case channel_position::unknown: return "UNKNOWN";
+        case channel_position::na: return "NA";
+        case channel_position::mono: return "MONO";
+        case channel_position::front_left: return "FL";
+        case channel_position::front_right: return "FR";
+        case channel_position::rear_left: return "RL";
+        case channel_position::rear_right: return "RR";
+        case channel_position::front_center: return "FC";
+        case channel_position::lfe: return "LFE";
+        case channel_position::side_left: return "SL";
+        case channel_position::side_right: return "SR";
+        case channel_position::rear_center: return "RC";
+        case channel_position::front_left_center: return "FLC";
+        case channel_position::front_right_center: return "FRC";
+        case channel_position::rear_left_center: return "RLC";
+        case channel_position::rear_right_center: return "RRC";
+        case channel_position::front_left_wide: return "FLW";
+        case channel_position::front_right_wide: return "FRW";
+        case channel_position::front_left_high: return "FLH";
+        case channel_position::front_center_high: return "FCH";
+        case channel_position::front_right_high: return "FRH";
+        case channel_position::top_center: return "TC";
+        case channel_position::top_front_left: return "TFL";
+        case channel_position::top_front_right: return "TFR";
+        case channel_position::top_front_center: return "TFC";
+        case channel_position::top_rear_left: return "TRL";
+        case channel_position::top_rear_right: return "TRR";
+        case channel_position::top_rear_center: return "TRC";
+        case channel_position::top_front_left_center: return "TFLC";
+        case channel_position::top_front_right_center: return "TFRC";
+        case channel_position::top_side_left: return "TSL";
+        case channel_position::top_side_right: return "TSR";
+        case channel_position::left_lfe: return "LLFE";
+        case channel_position::right_lfe: return "RLFE";
+        case channel_position::bottom_center: return "BC";
+        case channel_position::bottom_left_center: return "BLC";
+        case channel_position::bottom_right_center: return "BRC";
+    }
+    return "UNKNOWN";
+}
+
 namespace {
 
 constexpr int to_alsa_format(sample_format sf) noexcept {
@@ -237,10 +335,12 @@ constexpr snd_pcm_hw_params to_alsa_hw_params(const pcm_config &config, sample_a
     interval_ref<SNDRV_PCM_HW_PARAM_RATE>::set(params, config.rate);
     mask_ref<SNDRV_PCM_HW_PARAM_FORMAT>::set(params, to_alsa_format(config.format));
     mask_ref<SNDRV_PCM_HW_PARAM_ACCESS>::set(params, to_alsa_access(access));
+    if (config.disable_resampling) params.flags |= SNDRV_PCM_HW_PARAMS_NORESAMPLE;
+    if (config.disable_period_wakeup) params.flags |= SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP;
     return params;
 }
 
-size_type compute_boundary(size_type buffer_size) noexcept {
+constexpr size_type compute_boundary(size_type buffer_size) noexcept {
     size_type boundary = buffer_size;
     while (boundary * 2 <= static_cast<size_type>(LONG_MAX) - buffer_size) boundary *= 2;
     return boundary;
@@ -267,14 +367,12 @@ constexpr snd_pcm_sw_params to_alsa_sw_params(const pcm_config &config, bool is_
         params.stop_threshold = config.period_count * config.period_size;
     }
 
-    const size_type buf = config.period_count * config.period_size;
-    size_type boundary = buf;
-    while (boundary * 2 <= static_cast<size_type>(LONG_MAX) - buf) boundary *= 2;
-    params.boundary = boundary;
+    params.boundary = compute_boundary(config.period_count * config.period_size);
 
     params.xfer_align = config.period_size / 2;
     params.silence_size = 0;
     params.silence_threshold = config.silence_threshold;
+    if (config.enable_timestamps) params.tstamp_mode = SNDRV_PCM_TSTAMP_ENABLE;
     return params;
 }
 
@@ -428,7 +526,7 @@ result interleaved_pcm_reader::open(size_type card, size_type device, bool non_b
 generic_result<size_type> interleaved_pcm_reader::read_unformatted(void *frames, size_type frame_count) noexcept {
     snd_xferi transfer{0, frames, snd_pcm_uframes_t(frame_count)};
     auto err = ioctl(get_file_descriptor(), SNDRV_PCM_IOCTL_READI_FRAMES, &transfer);
-    if (err < 0) return {errno, 0};
+    if (UNLIKELY(err < 0)) return {errno, 0};
     return {0, size_type(transfer.result)};
 }
 
@@ -446,7 +544,47 @@ generic_result<size_type> interleaved_pcm_writer::write_unformatted(const void *
     transfer.buf = const_cast<void *>(frames);
     transfer.frames = static_cast<snd_pcm_uframes_t>(frame_count);
     auto err = ioctl(get_file_descriptor(), SNDRV_PCM_IOCTL_WRITEI_FRAMES, &transfer);
-    if (err < 0) return {errno, 0};
+    if (UNLIKELY(err < 0)) return {errno, 0};
+    return {0, static_cast<size_type>(transfer.result)};
+}
+
+// ============================================================================
+// Non-interleaved reader
+// ============================================================================
+
+result noninterleaved_pcm_reader::open(size_type card, size_type device, bool non_blocking) noexcept {
+    return pcm::open_capture_device(card, device, non_blocking);
+}
+
+generic_result<size_type> noninterleaved_pcm_reader::read_unformatted(void *const *channel_buffers, size_type channel_count, size_type frame_count) noexcept {
+    if (UNLIKELY(channel_count != channels_)) return {EINVAL, 0};
+
+    snd_xfern transfer;
+    transfer.result = 0;
+    transfer.bufs = const_cast<void **>(channel_buffers);
+    transfer.frames = static_cast<snd_pcm_uframes_t>(frame_count);
+    auto err = ioctl(get_file_descriptor(), SNDRV_PCM_IOCTL_READN_FRAMES, &transfer);
+    if (UNLIKELY(err < 0)) return {errno, 0};
+    return {0, static_cast<size_type>(transfer.result)};
+}
+
+// ============================================================================
+// Non-interleaved writer
+// ============================================================================
+
+result noninterleaved_pcm_writer::open(size_type card, size_type device, bool non_blocking) noexcept {
+    return pcm::open_playback_device(card, device, non_blocking);
+}
+
+generic_result<size_type> noninterleaved_pcm_writer::write_unformatted(const void *const *channel_buffers, size_type channel_count, size_type frame_count) noexcept {
+    if (UNLIKELY(channel_count != channels_)) return {EINVAL, 0};
+
+    snd_xfern transfer;
+    transfer.result = 0;
+    transfer.bufs = const_cast<void **>(channel_buffers);
+    transfer.frames = static_cast<snd_pcm_uframes_t>(frame_count);
+    auto err = ioctl(get_file_descriptor(), SNDRV_PCM_IOCTL_WRITEN_FRAMES, &transfer);
+    if (UNLIKELY(err < 0)) return {errno, 0};
     return {0, static_cast<size_type>(transfer.result)};
 }
 
@@ -581,8 +719,62 @@ generic_result<long> pcm::get_delay() const noexcept {
 
 int pcm::get_poll_events() const noexcept {
     if (!self || self->fd == invalid_fd()) return 0;
-    // POLLIN = 0x0001, POLLOUT = 0x0004
-    return self->is_capture ? 0x0001 : 0x0004;
+    return (self->is_capture ? POLLIN : POLLOUT) | POLLERR;
+}
+
+generic_result<size_type> pcm::rewind(size_type frames) noexcept {
+    using R = generic_result<size_type>;
+    if (!self) return R{ENOENT};
+    auto n = static_cast<snd_pcm_uframes_t>(frames);
+    if (::ioctl(self->fd, SNDRV_PCM_IOCTL_REWIND, &n) < 0) return R{errno};
+    return R{0, static_cast<size_type>(n)};
+}
+
+generic_result<size_type> pcm::forward(size_type frames) noexcept {
+    using R = generic_result<size_type>;
+    if (!self) return R{ENOENT};
+    auto n = static_cast<snd_pcm_uframes_t>(frames);
+    if (::ioctl(self->fd, SNDRV_PCM_IOCTL_FORWARD, &n) < 0) return R{errno};
+    return R{0, static_cast<size_type>(n)};
+}
+
+generic_result<pcm_channel_layout> pcm::get_channel_info(size_type channel) const noexcept {
+    using R = generic_result<pcm_channel_layout>;
+    if (!self) return R{ENOENT};
+    snd_pcm_channel_info info{};
+    info.channel = static_cast<unsigned int>(channel);
+    if (::ioctl(self->fd, SNDRV_PCM_IOCTL_CHANNEL_INFO, &info) < 0) return R{errno};
+
+    pcm_channel_layout layout{};
+    layout.mmap_offset = static_cast<long>(info.offset);
+    layout.first_bit = static_cast<size_type>(info.first);
+    layout.step_bits = static_cast<size_type>(info.step);
+    return R{0, layout};
+}
+
+generic_result<protocol_version> pcm::get_protocol_version() const noexcept {
+    using R = generic_result<protocol_version>;
+    if (!self) return R{ENOENT};
+    int raw = 0;
+    if (::ioctl(self->fd, SNDRV_PCM_IOCTL_PVERSION, &raw) < 0) return R{errno};
+
+    protocol_version v;
+    v.major = static_cast<unsigned int>(raw >> 16) & 0xffffu;
+    v.minor = static_cast<unsigned int>(raw >> 8) & 0xffu;
+    v.subminor = static_cast<unsigned int>(raw) & 0xffu;
+    return R{0, v};
+}
+
+generic_result<pcm::timestamp> pcm::get_timestamp() const noexcept {
+    using R = generic_result<timestamp>;
+    if (!self) return R{ENOENT};
+    snd_pcm_status status{};
+    if (::ioctl(self->fd, SNDRV_PCM_IOCTL_STATUS, &status) < 0) return R{errno};
+
+    timestamp ts;
+    ts.seconds = static_cast<long>(status.tstamp.tv_sec);
+    ts.nanoseconds = static_cast<long>(status.tstamp.tv_nsec);
+    return R{0, ts};
 }
 
 result pcm::setup(const pcm_config &config, sample_access access, bool is_capture) noexcept {
@@ -631,21 +823,55 @@ result pcm_impl::open_by_path(const char *path, bool non_blocking) noexcept {
 
 namespace {
 
-int mmap_setup_common(
-    int fd,
-    const pcm_config &config,
-    sample_access access,
-    bool is_capture,
-    void **out_ptr,
-    size_type *out_buffer_frames,
-    size_type *out_frame_bytes,
-    size_type *out_boundary
-) noexcept {
-    // Hardware parameters
+/**
+ * @brief Result of negotiating hw/sw params and mapping the DMA buffer.
+ *
+ * status_page/control_page are non-null only when the driver allows the
+ * lock-free direct path (see needs_explicit_sync below); callers must fall
+ * back to SNDRV_PCM_IOCTL_SYNC_PTR when they are null.
+ */
+struct mmap_setup_result final {
+    void *data_ptr = nullptr;
+    void *status_page = nullptr;
+    void *control_page = nullptr;
+    size_type buffer_frames = 0;
+    size_type frame_bytes = 0;
+    size_type boundary = 0;
+};
+
+/**
+ * Maps the read-only status page and read-write control page so hw_ptr/appl_ptr
+ * can be exchanged with the kernel by plain memory access instead of an ioctl
+ * per period. Only safe when the driver has not set SNDRV_PCM_INFO_SYNC_APPLPTR
+ * or SNDRV_PCM_INFO_EXPLICIT_SYNC in the info field HW_PARAMS returned; those
+ * flags mean the driver does not keep the mmap'd pages coherent on its own and
+ * requires the explicit SYNC_PTR ioctl instead. Returns false (data pages left
+ * unmapped) rather than treating a mmap failure on these optional pages as fatal,
+ * since the ioctl-based path in mmap_begin_write/mmap_begin_read/mmap_commit_common
+ * remains fully correct on any driver.
+ */
+bool try_map_direct_pointers(int fd, unsigned int hw_params_info, void **out_status, void **out_control) noexcept {
+    constexpr unsigned int explicit_sync_flags = SNDRV_PCM_INFO_SYNC_APPLPTR | SNDRV_PCM_INFO_EXPLICIT_SYNC;
+    if (hw_params_info & explicit_sync_flags) return false;
+
+    void *status = ::mmap(nullptr, sizeof(snd_pcm_mmap_status), PROT_READ, MAP_SHARED, fd, SNDRV_PCM_MMAP_OFFSET_STATUS);
+    if (status == MAP_FAILED) return false;
+
+    void *control = ::mmap(nullptr, sizeof(snd_pcm_mmap_control), PROT_READ | PROT_WRITE, MAP_SHARED, fd, SNDRV_PCM_MMAP_OFFSET_CONTROL);
+    if (control == MAP_FAILED) {
+        ::munmap(status, sizeof(snd_pcm_mmap_status));
+        return false;
+    }
+
+    *out_status = status;
+    *out_control = control;
+    return true;
+}
+
+int mmap_setup_common(int fd, const pcm_config &config, sample_access access, bool is_capture, mmap_setup_result *out) noexcept {
     auto hw_params = to_alsa_hw_params(config, access);
     if (ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hw_params) < 0) return errno;
 
-    // Software parameters
     auto sw_params = to_alsa_sw_params(config, is_capture);
     if (ioctl(fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sw_params) < 0) return errno;
 
@@ -657,90 +883,42 @@ int mmap_setup_common(
     if (frame_bytes == 0) return EINVAL;
 
     size_type map_size = buffer_frames * frame_bytes;
-
-    // Map the DMA data buffer (offset 0 = PCM data for modern ALSA drivers).
-    void *ptr = ::mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void *ptr = ::mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, SNDRV_PCM_MMAP_OFFSET_DATA);
     if (ptr == MAP_FAILED) return errno;
 
-    *out_ptr = ptr;
-    *out_buffer_frames = buffer_frames;
-    *out_frame_bytes = frame_bytes;
-    *out_boundary = compute_boundary(buffer_frames);
-    return 0;
-}
+    out->data_ptr = ptr;
+    out->buffer_frames = buffer_frames;
+    out->frame_bytes = frame_bytes;
+    out->boundary = compute_boundary(buffer_frames);
 
-void mmap_teardown_common(void *ptr, size_type buffer_frames, size_type frame_bytes) noexcept {
-    if (ptr && ptr != MAP_FAILED) ::munmap(ptr, buffer_frames * frame_bytes);
-}
-
-int mmap_begin_write(
-    int fd,
-    size_type appl_ptr,
-    size_type buffer_frames,
-    size_type boundary,
-    size_type frame_bytes,
-    void *mmap_data,
-    mmap_region *out
-) noexcept {
-    snd_pcm_sync_ptr sptr{};
-    sptr.flags = SNDRV_PCM_SYNC_PTR_HWSYNC;
-    if (ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sptr) < 0) return errno;
-
-    snd_pcm_uframes_t hw_ptr = sptr.s.status.hw_ptr;
-
-    // Frames used (written but not yet played)
-    size_type used;
-    if (appl_ptr >= (size_type)hw_ptr) {
-        used = appl_ptr - (size_type)hw_ptr;
-    } else {
-        used = boundary - ((size_type)hw_ptr - appl_ptr);
+    void *status = nullptr;
+    void *control = nullptr;
+    if (try_map_direct_pointers(fd, hw_params.info, &status, &control)) {
+        out->status_page = status;
+        out->control_page = control;
     }
-
-    if (used > buffer_frames) return EPIPE; // xrun
-
-    size_type avail = buffer_frames - used;
-    if (avail == 0) return EAGAIN;
-
-    // Limit to contiguous region (don't cross ring-buffer end)
-    size_type offset = appl_ptr % buffer_frames;
-    size_type contig = buffer_frames - offset;
-    if (avail > contig) avail = contig;
-
-    out->data = static_cast<char *>(mmap_data) + offset * frame_bytes;
-    out->offset = offset;
-    out->avail = avail;
     return 0;
+}
+
+void mmap_teardown_common(void *ptr, void *status_page, void *control_page, size_type buffer_frames, size_type frame_bytes) noexcept {
+    if (ptr && ptr != MAP_FAILED) ::munmap(ptr, buffer_frames * frame_bytes);
+    if (status_page) ::munmap(status_page, sizeof(snd_pcm_mmap_status));
+    if (control_page) ::munmap(control_page, sizeof(snd_pcm_mmap_control));
 }
 
 /**
- * Sync the hardware pointer and compute available frames for capture (read).
- * avail = hw_ptr - appl_ptr  [modulo boundary]
+ * Given a fresh hw_ptr, computes the writable slice of the ring buffer.
+ * Shared by both the direct-mmap and SYNC_PTR-ioctl paths so the xrun/wrap
+ * math exists in exactly one place.
  */
-int mmap_begin_read(
-    int fd,
-    size_type appl_ptr,
-    size_type buffer_frames,
-    size_type boundary,
-    size_type frame_bytes,
-    void *mmap_data,
-    mmap_region *out
+int compute_write_region(
+    size_type hw_ptr, size_type appl_ptr, size_type buffer_frames, size_type boundary, size_type frame_bytes, void *mmap_data, mmap_region *out
 ) noexcept {
-    snd_pcm_sync_ptr sptr{};
-    sptr.flags = SNDRV_PCM_SYNC_PTR_HWSYNC;
-    if (ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sptr) < 0) return errno;
+    size_type used = (appl_ptr >= hw_ptr) ? (appl_ptr - hw_ptr) : (boundary - (hw_ptr - appl_ptr));
+    if (UNLIKELY(used > buffer_frames)) return EPIPE; // underrun
 
-    snd_pcm_uframes_t hw_ptr = sptr.s.status.hw_ptr;
-
-    // Frames available to read (captured but not yet consumed)
-    size_type avail;
-    if ((size_type)hw_ptr >= appl_ptr) {
-        avail = (size_type)hw_ptr - appl_ptr;
-    } else {
-        avail = boundary - (appl_ptr - (size_type)hw_ptr);
-    }
-
-    if (avail > buffer_frames) return EPIPE; // overrun
-    if (avail == 0) return EAGAIN;
+    size_type avail = buffer_frames - used;
+    if (UNLIKELY(avail == 0)) return EAGAIN;
 
     size_type offset = appl_ptr % buffer_frames;
     size_type contig = buffer_frames - offset;
@@ -752,15 +930,67 @@ int mmap_begin_read(
     return 0;
 }
 
-int mmap_commit_common(int fd, size_type *appl_ptr, size_type frames, size_type boundary) noexcept {
+/** @brief Given a fresh hw_ptr, computes the readable slice of the ring buffer. */
+int compute_read_region(
+    size_type hw_ptr, size_type appl_ptr, size_type buffer_frames, size_type boundary, size_type frame_bytes, void *mmap_data, mmap_region *out
+) noexcept {
+    size_type avail = (hw_ptr >= appl_ptr) ? (hw_ptr - appl_ptr) : (boundary - (appl_ptr - hw_ptr));
+    if (UNLIKELY(avail > buffer_frames)) return EPIPE; // overrun
+    if (UNLIKELY(avail == 0)) return EAGAIN;
+
+    size_type offset = appl_ptr % buffer_frames;
+    size_type contig = buffer_frames - offset;
+    if (avail > contig) avail = contig;
+
+    out->data = static_cast<char *>(mmap_data) + offset * frame_bytes;
+    out->offset = offset;
+    out->avail = avail;
+    return 0;
+}
+
+/** @brief Reads hw_ptr straight out of the mapped status page with an acquire load. */
+size_type read_hw_ptr_direct(const void *status_page) noexcept {
+    const auto *status = static_cast<const snd_pcm_mmap_status *>(status_page);
+    return static_cast<size_type>(__atomic_load_n(&status->hw_ptr, __ATOMIC_ACQUIRE));
+}
+
+/** @brief Publishes appl_ptr into the mapped control page with a release store. */
+void write_appl_ptr_direct(void *control_page, size_type value) noexcept {
+    auto *control = static_cast<snd_pcm_mmap_control *>(control_page);
+    __atomic_store_n(&control->appl_ptr, static_cast<snd_pcm_uframes_t>(value), __ATOMIC_RELEASE);
+}
+
+int mmap_begin_write(
+    int fd, size_type appl_ptr, size_type buffer_frames, size_type boundary, size_type frame_bytes, void *mmap_data, mmap_region *out
+) noexcept {
+    snd_pcm_sync_ptr sptr{};
+    sptr.flags = SNDRV_PCM_SYNC_PTR_HWSYNC;
+    if (UNLIKELY(ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sptr) < 0)) return errno;
+    return compute_write_region(sptr.s.status.hw_ptr, appl_ptr, buffer_frames, boundary, frame_bytes, mmap_data, out);
+}
+
+int mmap_begin_read(
+    int fd, size_type appl_ptr, size_type buffer_frames, size_type boundary, size_type frame_bytes, void *mmap_data, mmap_region *out
+) noexcept {
+    snd_pcm_sync_ptr sptr{};
+    sptr.flags = SNDRV_PCM_SYNC_PTR_HWSYNC;
+    if (UNLIKELY(ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sptr) < 0)) return errno;
+    return compute_read_region(sptr.s.status.hw_ptr, appl_ptr, buffer_frames, boundary, frame_bytes, mmap_data, out);
+}
+
+int mmap_commit_common(int fd, size_type *appl_ptr, size_type frames, size_type boundary, size_type avail_min) noexcept {
     *appl_ptr += frames;
     if (*appl_ptr >= boundary) *appl_ptr -= boundary;
 
     snd_pcm_sync_ptr sptr{};
     sptr.flags = SNDRV_PCM_SYNC_PTR_APPL;
     sptr.c.control.appl_ptr = *appl_ptr;
-    sptr.c.control.avail_min = 1;
-    if (ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sptr) < 0) return errno;
+    // Must echo the avail_min negotiated at SW_PARAMS time. Overwriting it
+    // with a smaller value (e.g. 1) resets the kernel's poll/wakeup
+    // threshold on every commit, causing a wakeup storm instead of one
+    // wakeup per period.
+    sptr.c.control.avail_min = avail_min;
+    if (UNLIKELY(ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sptr) < 0)) return errno;
     return 0;
 }
 
@@ -771,7 +1001,7 @@ int mmap_commit_common(int fd, size_type *appl_ptr, size_type frames, size_type 
 // ============================================================================
 
 mmap_pcm_writer::~mmap_pcm_writer() {
-    mmap_teardown_common(mmap_data_, buffer_frames_, frame_bytes_);
+    mmap_teardown_common(mmap_data_, status_page_, control_page_, buffer_frames_, frame_bytes_);
 }
 
 result mmap_pcm_writer::open(size_type card, size_type device, bool non_blocking) noexcept {
@@ -779,39 +1009,54 @@ result mmap_pcm_writer::open(size_type card, size_type device, bool non_blocking
 }
 
 result mmap_pcm_writer::setup(const pcm_config &config) noexcept {
-    mmap_teardown_common(mmap_data_, buffer_frames_, frame_bytes_);
+    mmap_teardown_common(mmap_data_, status_page_, control_page_, buffer_frames_, frame_bytes_);
     mmap_data_ = nullptr;
+    status_page_ = nullptr;
+    control_page_ = nullptr;
     buffer_frames_ = 0;
     frame_bytes_ = 0;
     appl_ptr_ = 0;
     boundary_ = 0;
+    avail_min_ = 0;
+    has_direct_pointers_ = false;
 
-    int err = mmap_setup_common(
-        get_file_descriptor(),
-        config,
-        sample_access::mmap_interleaved,
-        false,
-        &mmap_data_,
-        &buffer_frames_,
-        &frame_bytes_,
-        &boundary_
-    );
+    mmap_setup_result setup_result{};
+    int err = mmap_setup_common(get_file_descriptor(), config, sample_access::mmap_interleaved, false, &setup_result);
     if (err) return err;
+
+    mmap_data_ = setup_result.data_ptr;
+    status_page_ = setup_result.status_page;
+    control_page_ = setup_result.control_page;
+    buffer_frames_ = setup_result.buffer_frames;
+    frame_bytes_ = setup_result.frame_bytes;
+    boundary_ = setup_result.boundary;
+    has_direct_pointers_ = status_page_ != nullptr;
+    avail_min_ = config.period_size;
     return 0;
 }
 
 generic_result<mmap_region> mmap_pcm_writer::begin() noexcept {
     using R = generic_result<mmap_region>;
     mmap_region rgn{};
-    int err = mmap_begin_write(get_file_descriptor(), appl_ptr_, buffer_frames_, boundary_, frame_bytes_, mmap_data_, &rgn);
+    int err;
+    if (has_direct_pointers_) {
+        size_type hw_ptr = read_hw_ptr_direct(status_page_);
+        err = compute_write_region(hw_ptr, appl_ptr_, buffer_frames_, boundary_, frame_bytes_, mmap_data_, &rgn);
+    } else {
+        err = mmap_begin_write(get_file_descriptor(), appl_ptr_, buffer_frames_, boundary_, frame_bytes_, mmap_data_, &rgn);
+    }
     if (err) return R{err};
     return R{0, rgn};
 }
 
 result mmap_pcm_writer::commit(size_type frames) noexcept {
-    int err = mmap_commit_common(get_file_descriptor(), &appl_ptr_, frames, boundary_);
-    if (err) return err;
-    return 0;
+    if (has_direct_pointers_) {
+        appl_ptr_ += frames;
+        if (appl_ptr_ >= boundary_) appl_ptr_ -= boundary_;
+        write_appl_ptr_direct(control_page_, appl_ptr_);
+        return 0;
+    }
+    return mmap_commit_common(get_file_descriptor(), &appl_ptr_, frames, boundary_, avail_min_);
 }
 
 // ============================================================================
@@ -819,7 +1064,7 @@ result mmap_pcm_writer::commit(size_type frames) noexcept {
 // ============================================================================
 
 mmap_pcm_reader::~mmap_pcm_reader() {
-    mmap_teardown_common(mmap_data_, buffer_frames_, frame_bytes_);
+    mmap_teardown_common(mmap_data_, status_page_, control_page_, buffer_frames_, frame_bytes_);
 }
 
 result mmap_pcm_reader::open(size_type card, size_type device, bool non_blocking) noexcept {
@@ -827,39 +1072,54 @@ result mmap_pcm_reader::open(size_type card, size_type device, bool non_blocking
 }
 
 result mmap_pcm_reader::setup(const pcm_config &config) noexcept {
-    mmap_teardown_common(mmap_data_, buffer_frames_, frame_bytes_);
+    mmap_teardown_common(mmap_data_, status_page_, control_page_, buffer_frames_, frame_bytes_);
     mmap_data_ = nullptr;
+    status_page_ = nullptr;
+    control_page_ = nullptr;
     buffer_frames_ = 0;
     frame_bytes_ = 0;
     appl_ptr_ = 0;
     boundary_ = 0;
+    avail_min_ = 0;
+    has_direct_pointers_ = false;
 
-    int err = mmap_setup_common(
-        get_file_descriptor(),
-        config,
-        sample_access::mmap_interleaved,
-        true,
-        &mmap_data_,
-        &buffer_frames_,
-        &frame_bytes_,
-        &boundary_
-    );
+    mmap_setup_result setup_result{};
+    int err = mmap_setup_common(get_file_descriptor(), config, sample_access::mmap_interleaved, true, &setup_result);
     if (err) return err;
+
+    mmap_data_ = setup_result.data_ptr;
+    status_page_ = setup_result.status_page;
+    control_page_ = setup_result.control_page;
+    buffer_frames_ = setup_result.buffer_frames;
+    frame_bytes_ = setup_result.frame_bytes;
+    boundary_ = setup_result.boundary;
+    has_direct_pointers_ = status_page_ != nullptr;
+    avail_min_ = config.period_size;
     return 0;
 }
 
 generic_result<mmap_region> mmap_pcm_reader::begin() noexcept {
     using R = generic_result<mmap_region>;
     mmap_region rgn{};
-    int err = mmap_begin_read(get_file_descriptor(), appl_ptr_, buffer_frames_, boundary_, frame_bytes_, mmap_data_, &rgn);
+    int err;
+    if (has_direct_pointers_) {
+        size_type hw_ptr = read_hw_ptr_direct(status_page_);
+        err = compute_read_region(hw_ptr, appl_ptr_, buffer_frames_, boundary_, frame_bytes_, mmap_data_, &rgn);
+    } else {
+        err = mmap_begin_read(get_file_descriptor(), appl_ptr_, buffer_frames_, boundary_, frame_bytes_, mmap_data_, &rgn);
+    }
     if (err) return R{err};
     return R{0, rgn};
 }
 
 result mmap_pcm_reader::commit(size_type frames) noexcept {
-    int err = mmap_commit_common(get_file_descriptor(), &appl_ptr_, frames, boundary_);
-    if (err) return err;
-    return 0;
+    if (has_direct_pointers_) {
+        appl_ptr_ += frames;
+        if (appl_ptr_ >= boundary_) appl_ptr_ -= boundary_;
+        write_appl_ptr_direct(control_page_, appl_ptr_);
+        return 0;
+    }
+    return mmap_commit_common(get_file_descriptor(), &appl_ptr_, frames, boundary_, avail_min_);
 }
 
 // ============================================================================
@@ -1203,7 +1463,31 @@ generic_result<size_type> pcm_params::get_max_buffer_size() const noexcept {
 
 result pcm_recover(pcm &p, int err, bool silent) noexcept {
     (void)silent;
-    if (err == EPIPE || err == ESTRPIPE || err == EAGAIN) return p.prepare();
+
+    // EAGAIN means "no frames available right now" in non-blocking mode.
+    // The stream is not broken, so running PREPARE here would needlessly
+    // drop buffered audio; just report it back to the caller to retry.
+    if (err == EAGAIN) return {EAGAIN};
+
+    if (err == EPIPE) return p.prepare();
+
+    if (err == ESTRPIPE) {
+        // Kernel-suspended device (e.g. system sleep). Per the ALSA
+        // suspend/resume protocol, try RESUME first so buffered audio and
+        // stream position survive; only fall back to PREPARE (which drops
+        // buffered audio) if the driver has no resume support.
+        int fd = p.get_file_descriptor();
+        int r;
+        for (;;) {
+            r = ::ioctl(fd, SNDRV_PCM_IOCTL_RESUME);
+            if (r >= 0) return {0};
+            if (errno != EAGAIN) break;
+            usleep(1000);
+        }
+        if (errno == ENOSYS || errno == EINVAL) return p.prepare();
+        return {errno};
+    }
+
     return {err};
 }
 
@@ -1218,6 +1502,8 @@ mixer_ctl::mixer_ctl(mixer_ctl &&other) noexcept
     : fd(other.fd)
     , min_(other.min_)
     , max_(other.max_)
+    , min64_(other.min64_)
+    , max64_(other.max64_)
     , count_(other.count_)
     , elem_type_(other.elem_type_)
     , numid_(other.numid_)
@@ -1226,7 +1512,8 @@ mixer_ctl::mixer_ctl(mixer_ctl &&other) noexcept
     , subdevice_(other.subdevice_)
     , index_(other.index_)
     , enum_names_(other.enum_names_)
-    , enum_items_count_(other.enum_items_count_) {
+    , enum_items_count_(other.enum_items_count_)
+    , has_tlv_(other.has_tlv_) {
     memcpy(name_, other.name_, sizeof(name_));
     other.fd = invalid_fd();
     other.enum_names_ = nullptr;
@@ -1238,6 +1525,8 @@ mixer_ctl &mixer_ctl::operator=(mixer_ctl &&other) noexcept {
         fd = other.fd;
         min_ = other.min_;
         max_ = other.max_;
+        min64_ = other.min64_;
+        max64_ = other.max64_;
         count_ = other.count_;
         elem_type_ = other.elem_type_;
         numid_ = other.numid_;
@@ -1247,6 +1536,7 @@ mixer_ctl &mixer_ctl::operator=(mixer_ctl &&other) noexcept {
         index_ = other.index_;
         enum_names_ = other.enum_names_;
         enum_items_count_ = other.enum_items_count_;
+        has_tlv_ = other.has_tlv_;
         memcpy(name_, other.name_, sizeof(name_));
         other.fd = invalid_fd();
         other.enum_names_ = nullptr;
@@ -1312,6 +1602,46 @@ result mixer_ctl::set_all_values(long value) const noexcept {
     snd_ctl_elem_value ev{};
     ev.id.numid = numid_;
     for (size_type i = 0; i < count_; ++i) ev.value.integer.value[i] = value;
+    if (ioctl(fd, SNDRV_CTL_IOCTL_ELEM_WRITE, &ev) < 0) return {errno};
+    return {0};
+}
+
+// 64-bit integer accessors
+
+generic_result<long long> mixer_ctl::get_int64(size_type index) const noexcept {
+    if (fd == invalid_fd()) return {ENOENT};
+    if (index >= count_) return {EINVAL};
+    if (elem_type_ != SNDRV_CTL_ELEM_TYPE_INTEGER64) return {EINVAL};
+
+    snd_ctl_elem_value ev{};
+    ev.id.numid = numid_;
+    if (ioctl(fd, SNDRV_CTL_IOCTL_ELEM_READ, &ev) < 0) return {errno};
+    return {0, ev.value.integer64.value[index]};
+}
+
+result mixer_ctl::set_int64(long long value, size_type index) const noexcept {
+    if (fd == invalid_fd()) return {ENOENT};
+    if (index >= count_) return {EINVAL};
+    if (elem_type_ != SNDRV_CTL_ELEM_TYPE_INTEGER64) return {EINVAL};
+    if (value < min64_ || value > max64_) return {EINVAL};
+
+    snd_ctl_elem_value ev{};
+    ev.id.numid = numid_;
+    // Read current to preserve other element values (e.g. the other stereo channel)
+    if (ioctl(fd, SNDRV_CTL_IOCTL_ELEM_READ, &ev) < 0) return {errno};
+    ev.value.integer64.value[index] = value;
+    if (ioctl(fd, SNDRV_CTL_IOCTL_ELEM_WRITE, &ev) < 0) return {errno};
+    return {0};
+}
+
+result mixer_ctl::set_all_int64(long long value) const noexcept {
+    if (fd == invalid_fd()) return {ENOENT};
+    if (elem_type_ != SNDRV_CTL_ELEM_TYPE_INTEGER64) return {EINVAL};
+    if (value < min64_ || value > max64_) return {EINVAL};
+
+    snd_ctl_elem_value ev{};
+    ev.id.numid = numid_;
+    for (size_type i = 0; i < count_; ++i) ev.value.integer64.value[i] = value;
     if (ioctl(fd, SNDRV_CTL_IOCTL_ELEM_WRITE, &ev) < 0) return {errno};
     return {0};
 }
@@ -1430,6 +1760,70 @@ result mixer_ctl::set_byte(unsigned char value, size_type index) const noexcept 
     ev.value.bytes.data[index] = value;
     if (ioctl(fd, SNDRV_CTL_IOCTL_ELEM_WRITE, &ev) < 0) return {errno};
     return {0};
+}
+
+// TLV / dB range accessors
+
+generic_result<mixer_ctl::dB_range> mixer_ctl::get_dB_range() const noexcept {
+    using R = generic_result<dB_range>;
+    if (fd == invalid_fd()) return R{ENOENT};
+    if (!has_tlv_) return R{ENOSYS};
+
+    // 4 payload words covers every dB TLV shape this function decodes
+    // (DB_SCALE and DB_MINMAX(_MUTE) are both {type, length, value0, value1}).
+    unsigned char raw[sizeof(snd_ctl_tlv) + 4 * sizeof(unsigned int)];
+    auto *tlv = reinterpret_cast<snd_ctl_tlv *>(raw);
+    tlv->numid = numid_;
+    tlv->length = 4 * sizeof(unsigned int);
+    if (ioctl(fd, SNDRV_CTL_IOCTL_TLV_READ, tlv) < 0) return R{errno};
+    if (tlv->length < 2 * sizeof(unsigned int)) return R{ENOTSUP};
+
+    dB_range out{};
+    switch (tlv->tlv[0]) {
+        case SNDRV_CTL_TLVT_DB_SCALE:
+            out.min_millibel = static_cast<long>(static_cast<int>(tlv->tlv[2]));
+            out.step_millibel = static_cast<long>(tlv->tlv[3] & SNDRV_CTL_TLVD_DB_SCALE_MASK);
+            out.has_mute = (tlv->tlv[3] & SNDRV_CTL_TLVD_DB_SCALE_MUTE) != 0;
+            out.max_millibel = out.min_millibel + out.step_millibel * (max_ - min_);
+            return R{0, out};
+
+        case SNDRV_CTL_TLVT_DB_MINMAX:
+        case SNDRV_CTL_TLVT_DB_MINMAX_MUTE:
+            out.min_millibel = static_cast<long>(static_cast<int>(tlv->tlv[2]));
+            out.max_millibel = static_cast<long>(static_cast<int>(tlv->tlv[3]));
+            out.has_mute = (tlv->tlv[0] == SNDRV_CTL_TLVT_DB_MINMAX_MUTE);
+            return R{0, out};
+
+        default:
+            // DB_RANGE (piecewise) and DB_LINEAR shapes need the full payload
+            // decoded by the caller; get_tlv_raw() exposes it unmodified.
+            return R{ENOTSUP};
+    }
+}
+
+generic_result<size_type> mixer_ctl::get_tlv_raw(unsigned int *buffer, size_type buffer_words) const noexcept {
+    using R = generic_result<size_type>;
+    if (fd == invalid_fd()) return R{ENOENT};
+    if (!has_tlv_) return R{ENOSYS};
+    if (!buffer || buffer_words == 0) return R{EINVAL};
+
+    size_type alloc_bytes = sizeof(snd_ctl_tlv) + buffer_words * sizeof(unsigned int);
+    auto *raw = static_cast<unsigned char *>(malloc(alloc_bytes));
+    if (!raw) return R{ENOMEM};
+
+    auto *tlv = reinterpret_cast<snd_ctl_tlv *>(raw);
+    tlv->numid = numid_;
+    tlv->length = static_cast<unsigned int>(buffer_words * sizeof(unsigned int));
+    if (ioctl(fd, SNDRV_CTL_IOCTL_TLV_READ, tlv) < 0) {
+        int err = errno;
+        free(raw);
+        return R{err};
+    }
+
+    size_type words_out = std::min(static_cast<size_type>(tlv->length / sizeof(unsigned int)), buffer_words);
+    memcpy(buffer, tlv->tlv, words_out * sizeof(unsigned int));
+    free(raw);
+    return R{0, words_out};
 }
 
 // ============================================================================
@@ -1566,12 +1960,16 @@ result mixer::open(size_type card) noexcept {
         ctl.index_ = info.id.index;
         ctl.elem_type_ = info.type;
         ctl.count_ = info.count;
+        ctl.has_tlv_ = (info.access & SNDRV_CTL_ELEM_ACCESS_TLV_READ) != 0;
         strncpy(ctl.name_, reinterpret_cast<const char *>(info.id.name), sizeof(ctl.name_) - 1);
         ctl.name_[sizeof(ctl.name_) - 1] = '\0';
 
         if (info.type == SNDRV_CTL_ELEM_TYPE_INTEGER) {
             ctl.min_ = info.value.integer.min;
             ctl.max_ = info.value.integer.max;
+        } else if (info.type == SNDRV_CTL_ELEM_TYPE_INTEGER64) {
+            ctl.min64_ = info.value.integer64.min;
+            ctl.max64_ = info.value.integer64.max;
         }
 
         // Load enum item names by querying each item index separately.
@@ -1673,6 +2071,46 @@ generic_result<mixer_event> mixer::read_event() noexcept {
     out.numid = ev.data.elem.id.numid;
     out.mask = ev.data.elem.mask;
     return R{0, out};
+}
+
+generic_result<protocol_version> mixer::get_protocol_version() const noexcept {
+    using R = generic_result<protocol_version>;
+    if (!self || self->fd == invalid_fd()) return R{ENOENT};
+    int raw = 0;
+    if (ioctl(self->fd, SNDRV_CTL_IOCTL_PVERSION, &raw) < 0) return R{errno};
+
+    protocol_version v;
+    v.major = static_cast<unsigned int>(raw >> 16) & 0xffffu;
+    v.minor = static_cast<unsigned int>(raw >> 8) & 0xffu;
+    v.subminor = static_cast<unsigned int>(raw) & 0xffu;
+    return R{0, v};
+}
+
+result mixer::add_integer_control(const char *name, long min, long max, long step, size_type count) noexcept {
+    if (!self || self->fd == invalid_fd()) return {ENOENT};
+    if (!name || count == 0 || count > 128) return {EINVAL};
+
+    snd_ctl_elem_info info{};
+    info.id.iface = SNDRV_CTL_ELEM_IFACE_MIXER;
+    strncpy(reinterpret_cast<char *>(info.id.name), name, sizeof(info.id.name) - 1);
+    info.type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+    info.count = static_cast<unsigned int>(count);
+    info.value.integer.min = min;
+    info.value.integer.max = max;
+    info.value.integer.step = step;
+    if (ioctl(self->fd, SNDRV_CTL_IOCTL_ELEM_ADD, &info) < 0) return {errno};
+    return {0};
+}
+
+result mixer::remove_control(const char *name) noexcept {
+    if (!self || self->fd == invalid_fd()) return {ENOENT};
+    const mixer_ctl *ctl = get_ctl_by_name(name);
+    if (!ctl) return {ENOENT};
+
+    snd_ctl_elem_id id{};
+    id.numid = ctl->get_numid();
+    if (ioctl(self->fd, SNDRV_CTL_IOCTL_ELEM_REMOVE, &id) < 0) return {errno};
+    return {0};
 }
 
 } // namespace tinyalsa

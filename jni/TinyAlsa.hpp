@@ -330,6 +330,27 @@ struct pcm_config final {
     size_type start_threshold = 0;
     size_type stop_threshold = 0;
     size_type silence_threshold = 0;
+
+    /**
+     * @brief Requests SNDRV_PCM_HW_PARAMS_NORESAMPLE.
+     * @note Fails setup() with EINVAL if the requested rate is not natively
+     * supported and the driver would otherwise have resampled to reach it.
+     */
+    bool disable_resampling = false;
+
+    /**
+     * @brief Requests SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP.
+     * @note Only takes effect if the device advertises SNDRV_PCM_INFO_NO_PERIOD_WAKEUP;
+     * silently ignored otherwise. Combine with an external timer-driven poll loop,
+     * since the driver will not wake the caller on period boundaries.
+     */
+    bool disable_period_wakeup = false;
+
+    /**
+     * @brief Requests SNDRV_PCM_TSTAMP_ENABLE so pcm::get_timestamp() reflects the
+     * time of the most recent hardware pointer update rather than being left at zero.
+     */
+    bool enable_timestamps = false;
 };
 
 // ============================================================================
@@ -352,6 +373,82 @@ struct pcm_info final {
     size_type subdevices_available = 0;
 
     bool is_capture = false;
+};
+
+// ============================================================================
+// protocol_version
+// ============================================================================
+
+/** @brief Decoded SNDRV_PROTOCOL_VERSION(major, minor, subminor) result from a PVERSION ioctl. */
+struct protocol_version final {
+    unsigned int major = 0;
+    unsigned int minor = 0;
+    unsigned int subminor = 0;
+};
+
+// ============================================================================
+// channel_position
+// ============================================================================
+
+/** @brief Spatial channel role, mirrors the kernel's SNDRV_CHMAP_* enum. */
+enum class channel_position {
+    unknown,
+    na,
+    mono,
+    front_left,
+    front_right,
+    rear_left,
+    rear_right,
+    front_center,
+    lfe,
+    side_left,
+    side_right,
+    rear_center,
+    front_left_center,
+    front_right_center,
+    rear_left_center,
+    rear_right_center,
+    front_left_wide,
+    front_right_wide,
+    front_left_high,
+    front_center_high,
+    front_right_high,
+    top_center,
+    top_front_left,
+    top_front_right,
+    top_front_center,
+    top_rear_left,
+    top_rear_right,
+    top_rear_center,
+    top_front_left_center,
+    top_front_right_center,
+    top_side_left,
+    top_side_right,
+    left_lfe,
+    right_lfe,
+    bottom_center,
+    bottom_left_center,
+    bottom_right_center
+};
+
+/** @brief Converts a raw SNDRV_CHMAP_* value (as read from a channel-map mixer control) to a @ref channel_position. */
+channel_position to_channel_position(unsigned int raw_chmap_value) noexcept;
+
+/** @brief Human-readable name for a @ref channel_position, e.g. "FL", "LFE". */
+const char *to_string(channel_position pos) noexcept;
+
+// ============================================================================
+// pcm_channel_layout
+// ============================================================================
+
+/**
+ * @brief Buffer layout of one channel within a non-interleaved DMA area, as
+ * reported by SNDRV_PCM_IOCTL_CHANNEL_INFO.
+ */
+struct pcm_channel_layout final {
+    long mmap_offset;   ///< Byte offset of the mmap region this channel lives in
+    size_type first_bit; ///< Bit offset to the first sample
+    size_type step_bits; ///< Bit distance between consecutive samples of this channel
 };
 
 // ============================================================================
@@ -410,6 +507,44 @@ public:
      */
     int get_poll_events() const noexcept;
 
+    /**
+     * @brief Pushes the application pointer backward, replaying already-consumed frames.
+     * @param frames Requested frame count to rewind.
+     * @return Frames actually rewound (may be less than requested), or a negative errno.
+     */
+    generic_result<size_type> rewind(size_type frames) noexcept;
+
+    /**
+     * @brief Pushes the application pointer forward, skipping buffered frames.
+     * @param frames Requested frame count to skip.
+     * @return Frames actually skipped (may be less than requested), or a negative errno.
+     */
+    generic_result<size_type> forward(size_type frames) noexcept;
+
+    /**
+     * @brief Reports where one channel's samples live within the mmap'd DMA area.
+     * @note Only meaningful once setup() has negotiated a non-interleaved access mode;
+     * with interleaved access every channel reports the same interleaved layout.
+     */
+    generic_result<pcm_channel_layout> get_channel_info(size_type channel) const noexcept;
+
+    /**
+     * @brief Kernel PCM ioctl protocol version (SNDRV_PCM_IOCTL_PVERSION).
+     */
+    generic_result<protocol_version> get_protocol_version() const noexcept;
+
+    /** @brief Reference timestamp of the most recent hardware pointer update. */
+    struct timestamp final {
+        long seconds = 0;
+        long nanoseconds = 0;
+    };
+
+    /**
+     * @brief Returns the timestamp attached to the last status refresh.
+     * @note Only updated by the driver when pcm_config::enable_timestamps was set at setup() time.
+     */
+    generic_result<timestamp> get_timestamp() const noexcept;
+
     result open_capture_device(size_type card = 0, size_type device = 0, bool non_blocking = true) noexcept;
     result open_playback_device(size_type card = 0, size_type device = 0, bool non_blocking = true) noexcept;
 
@@ -458,6 +593,62 @@ public:
 };
 
 // ============================================================================
+// noninterleaved_reader / noninterleaved_pcm_reader
+// ============================================================================
+
+class noninterleaved_reader {
+public:
+    /**
+     * @param channel_buffers One destination pointer per channel, in channel order.
+     * @param channel_count   Must equal the channel count negotiated at setup(); a
+     * mismatch is rejected before the ioctl, since the kernel walks exactly
+     * pcm_config::channels pointers and a short array causes an out-of-bounds read.
+     */
+    virtual generic_result<size_type> read_unformatted(void *const *channel_buffers, size_type channel_count, size_type frame_count) noexcept = 0;
+};
+
+class noninterleaved_pcm_reader final : public pcm, public noninterleaved_reader {
+    size_type channels_ = 0;
+
+public:
+    result open(size_type card = 0, size_type device = 0, bool non_blocking = false) noexcept;
+
+    inline result setup(const pcm_config &config = pcm_config()) noexcept {
+        channels_ = config.channels;
+        return pcm::setup(config, sample_access::non_interleaved, true);
+    }
+
+    generic_result<size_type> read_unformatted(void *const *channel_buffers, size_type channel_count, size_type frame_count) noexcept override;
+};
+
+// ============================================================================
+// noninterleaved_writer / noninterleaved_pcm_writer
+// ============================================================================
+
+class noninterleaved_writer {
+public:
+    /**
+     * @param channel_buffers One source pointer per channel, in channel order.
+     * @param channel_count   Must equal the channel count negotiated at setup().
+     */
+    virtual generic_result<size_type> write_unformatted(const void *const *channel_buffers, size_type channel_count, size_type frame_count) noexcept = 0;
+};
+
+class noninterleaved_pcm_writer final : public pcm, public noninterleaved_writer {
+    size_type channels_ = 0;
+
+public:
+    result open(size_type card = 0, size_type device = 0, bool non_blocking = false) noexcept;
+
+    inline result setup(const pcm_config &config = pcm_config()) noexcept {
+        channels_ = config.channels;
+        return pcm::setup(config, sample_access::non_interleaved, false);
+    }
+
+    generic_result<size_type> write_unformatted(const void *const *channel_buffers, size_type channel_count, size_type frame_count) noexcept override;
+};
+
+// ============================================================================
 // mmap_region
 // ============================================================================
 
@@ -479,10 +670,16 @@ struct mmap_region final {
  */
 class mmap_pcm_writer final : public pcm {
     void *mmap_data_ = nullptr;
+    void *status_page_ = nullptr;
+    void *control_page_ = nullptr;
     size_type buffer_frames_ = 0;
     size_type frame_bytes_ = 0;
     size_type appl_ptr_ = 0;
     size_type boundary_ = 0;
+    size_type avail_min_ = 0;
+
+    /** @brief True once status/control pages are mapped and SYNC_PTR ioctls can be skipped. */
+    bool has_direct_pointers_ = false;
 
 public:
     mmap_pcm_writer() noexcept = default;
@@ -525,10 +722,16 @@ public:
  */
 class mmap_pcm_reader final : public pcm {
     void *mmap_data_ = nullptr;
+    void *status_page_ = nullptr;
+    void *control_page_ = nullptr;
     size_type buffer_frames_ = 0;
     size_type frame_bytes_ = 0;
     size_type appl_ptr_ = 0;
     size_type boundary_ = 0;
+    size_type avail_min_ = 0;
+
+    /** @brief True once status/control pages are mapped and SYNC_PTR ioctls can be skipped. */
+    bool has_direct_pointers_ = false;
 
 public:
     mmap_pcm_reader() noexcept = default;
@@ -702,6 +905,8 @@ class mixer_ctl {
     char name_[64] = {};
     long min_ = 0;
     long max_ = 0;
+    long long min64_ = 0;
+    long long max64_ = 0;
     size_type count_ = 0;
     unsigned int elem_type_ = 0;
     unsigned int numid_ = 0;
@@ -712,6 +917,7 @@ class mixer_ctl {
 
     char *enum_names_ = nullptr;
     unsigned int enum_items_count_ = 0;
+    bool has_tlv_ = false;
 
     mixer_ctl() noexcept = default;
 
@@ -771,6 +977,31 @@ public:
 
     /** @brief Writes @p value to every integer element. */
     result set_all_values(long value) const noexcept;
+
+    // 64-bit integer accessors
+
+    generic_result<long long> get_min64() const noexcept {
+        return {0, min64_};
+    }
+    generic_result<long long> get_max64() const noexcept {
+        return {0, max64_};
+    }
+
+    /**
+     * @brief Reads one 64-bit integer element.
+     * @param index Element index.
+     * @return Value, or EINVAL if type is not SNDRV_CTL_ELEM_TYPE_INTEGER64 or index is out of range.
+     */
+    generic_result<long long> get_int64(size_type index = 0) const noexcept;
+
+    /**
+     * @brief Writes one 64-bit integer element.
+     * @param value Should be within [get_min64(), get_max64()].
+     */
+    result set_int64(long long value, size_type index = 0) const noexcept;
+
+    /** @brief Writes @p value to every 64-bit integer element. */
+    result set_all_int64(long long value) const noexcept;
 
     // Boolean accessors
 
@@ -834,6 +1065,41 @@ public:
      * @brief Writes one byte to a bytes-type control.
      */
     result set_byte(unsigned char value, size_type index = 0) const noexcept;
+
+    // TLV / dB range accessors
+
+    /** @brief True if the driver publishes TLV metadata for this control (SNDRV_CTL_ELEM_ACCESS_TLV_READ). */
+    bool has_tlv() const noexcept {
+        return has_tlv_;
+    }
+
+    /** @brief Decoded dB range for a volume control, from its SNDRV_CTL_TLVT_DB_SCALE/DB_MINMAX(_MUTE) TLV. */
+    struct dB_range final {
+        long min_millibel = 0;  ///< Volume at get_min(), in hundredths of a dB
+        long max_millibel = 0;  ///< Volume at get_max(), in hundredths of a dB
+        long step_millibel = 0; ///< dB step per integer step (0 for the MINMAX shapes, which are non-linear)
+        bool has_mute = false;  ///< True if get_min() also mutes the control
+    };
+
+    /**
+     * @brief Reads and decodes this control's dB-scale TLV, if it has one.
+     * @return dB_range on success.
+     *         ENOSYS if has_tlv() is false.
+     *         ENOTSUP if the TLV is a shape this wrapper doesn't decode
+     *         (e.g. SNDRV_CTL_TLVT_DB_RANGE or SNDRV_CTL_TLVT_DB_LINEAR); use
+     *         get_tlv_raw() to inspect those directly.
+     */
+    generic_result<dB_range> get_dB_range() const noexcept;
+
+    /**
+     * @brief Reads the raw TLV blob (SNDRV_CTL_IOCTL_TLV_READ) for control types this
+     * wrapper doesn't interpret itself, such as channel-map descriptors
+     * (SNDRV_CTL_TLVT_CHMAP_*).
+     * @param buffer       Destination for the raw 32-bit TLV words (type, length, payload...).
+     * @param buffer_words Capacity of @p buffer in 32-bit words.
+     * @return Number of words actually written into @p buffer.
+     */
+    generic_result<size_type> get_tlv_raw(unsigned int *buffer, size_type buffer_words) const noexcept;
 };
 
 // ============================================================================
@@ -878,6 +1144,24 @@ public:
      *         ENOENT if the mixer is not open.
      */
     generic_result<mixer_event> read_event() noexcept;
+
+    /** @brief Kernel control ioctl protocol version (SNDRV_CTL_IOCTL_PVERSION). */
+    generic_result<protocol_version> get_protocol_version() const noexcept;
+
+    /**
+     * @brief Creates a user-defined integer control (SNDRV_CTL_IOCTL_ELEM_ADD).
+     * @note Takes effect on the card immediately, but this mixer's own cached control
+     * list is not refreshed; call open() again to see the new control through
+     * get_ctl_by_name()/get_ctl().
+     */
+    result add_integer_control(const char *name, long min, long max, long step = 1, size_type count = 1) noexcept;
+
+    /**
+     * @brief Removes a control previously created with add_integer_control().
+     * @note Only user-defined controls (SNDRV_CTL_ELEM_ACCESS_USER) can be removed;
+     * driver-owned controls return EINVAL, matching the kernel's own restriction.
+     */
+    result remove_control(const char *name) noexcept;
 };
 
 // ============================================================================
