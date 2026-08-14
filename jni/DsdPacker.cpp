@@ -6,8 +6,8 @@
 #include <vector>
 
 #if defined(__ARM_NEON)
-#include <arm_neon.h>
-#define DSD_PACKER_HAVE_NEON 1
+    #include <arm_neon.h>
+    #define DSD_PACKER_HAVE_NEON 1
 #endif
 
 namespace {
@@ -100,12 +100,13 @@ DsdOutputMode choose_dsd_output_mode(
     }
 
     if (allowDop) {
-        // DoP packs 2 raw DSD bytes (16 bits) per 24-bit PCM word, so the PCM word
-        // rate is dsdRate / 2 given dsdRate is already a byte rate (see note above).
         tinyalsa::size_type dopRate = dsdRate / 2;
-        if (params.test_config(2, dopRate, tinyalsa::sample_format::s24_le) ||
-            params.test_config(2, dopRate, tinyalsa::sample_format::s32_le))
+
+        if (params.test_config(2, dopRate, tinyalsa::sample_format::s24_3le) ||
+            params.test_config(2, dopRate, tinyalsa::sample_format::s24_le) ||
+            params.test_config(2, dopRate, tinyalsa::sample_format::s32_le)) {
             return DsdOutputMode::Dop;
+        }
     }
 
     return DsdOutputMode::Pcm;
@@ -187,9 +188,7 @@ size_t DopPacker::pack(const uint8_t *in, size_t inBytes, int32_t *out, size_t o
 
     auto emit = [&](uint8_t older, uint8_t newer, size_t frame, int channel) {
         uint32_t marker = markerOdd_ ? kDopMarkerOdd : kDopMarkerEven;
-        uint32_t word24 = marker |
-                          (static_cast<uint32_t>(older) << 8) |
-                          static_cast<uint32_t>(newer);
+        uint32_t word24 = marker | (static_cast<uint32_t>(older) << 8) | static_cast<uint32_t>(newer);
 
         uint32_t word32;
         if (widening_) {
@@ -204,8 +203,7 @@ size_t DopPacker::pack(const uint8_t *in, size_t inBytes, int32_t *out, size_t o
     };
 
     if (layout_.planar) {
-        const size_t groupBytes =
-            static_cast<size_t>(layout_.block_size) * static_cast<size_t>(channels);
+        const size_t groupBytes = static_cast<size_t>(layout_.block_size) * static_cast<size_t>(channels);
         const size_t framesPerGroup = layout_.block_size / 2;
 
         if (groupBytes == 0 || framesPerGroup == 0) return 0;
@@ -222,8 +220,7 @@ size_t DopPacker::pack(const uint8_t *in, size_t inBytes, int32_t *out, size_t o
 
                 for (size_t k = 0; k < framesPerGroup; ++k) {
                     for (int c = 0; c < channels; ++c) {
-                        const uint8_t *block =
-                            group + static_cast<size_t>(c) * layout_.block_size;
+                        const uint8_t *block = group + static_cast<size_t>(c) * layout_.block_size;
 
                         emit(block[2 * k], block[2 * k + 1], written + k, c);
                     }
@@ -234,10 +231,7 @@ size_t DopPacker::pack(const uint8_t *in, size_t inBytes, int32_t *out, size_t o
                 written += framesPerGroup;
             }
 
-            pending_.erase(
-                pending_.begin(),
-                pending_.begin() + static_cast<std::ptrdiff_t>(groups * groupBytes)
-            );
+            pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(groups * groupBytes));
         }
 
         return written;
@@ -263,10 +257,114 @@ size_t DopPacker::pack(const uint8_t *in, size_t inBytes, int32_t *out, size_t o
             markerOdd_ = !markerOdd_;
         }
 
-        pending_.erase(
-            pending_.begin(),
-            pending_.begin() + static_cast<std::ptrdiff_t>(frames * pairBytes)
-        );
+        pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(frames * pairBytes));
+
+        written += frames;
+    }
+
+    return written;
+}
+
+size_t DopPacker::pack24(const uint8_t *in, size_t inBytes, uint8_t *out, size_t outCapacityFrames) {
+    if (in && inBytes) {
+        const size_t offset = pending_.size();
+        pending_.resize(offset + inBytes);
+
+        // Keep the same bit-order behavior as the existing pack() path.
+        if (layout_.msb_first) {
+            std::memcpy(pending_.data() + offset, in, inBytes);
+        } else {
+            reverse_bits_bulk(in, pending_.data() + offset, inBytes);
+        }
+    }
+
+    const int channels = layout_.channels;
+    size_t written = 0;
+
+    auto emit = [&](uint8_t older, uint8_t newer, size_t frame, int channel) {
+        uint32_t marker = markerOdd_ ? kDopMarkerOdd : kDopMarkerEven;
+
+        uint32_t word24 = marker | (static_cast<uint32_t>(older) << 8) | static_cast<uint32_t>(newer);
+
+        // S24_3LE: little-endian packed 24-bit sample.
+        //
+        // word24 layout:
+        //   bits 23:16 = DoP marker
+        //   bits 15:8  = older DSD byte
+        //   bits 7:0   = newer DSD byte
+        //
+        // Little-endian byte order:
+        //   [newer] [older] [marker]
+        uint8_t *dst = out + ((frame * static_cast<size_t>(channels) + static_cast<size_t>(channel)) * 3);
+
+        dst[0] = static_cast<uint8_t>(word24 & 0xFFu);
+        dst[1] = static_cast<uint8_t>((word24 >> 8) & 0xFFu);
+        dst[2] = static_cast<uint8_t>((word24 >> 16) & 0xFFu);
+    };
+
+    if (layout_.planar) {
+        const size_t groupBytes = static_cast<size_t>(layout_.block_size) * static_cast<size_t>(channels);
+
+        const size_t framesPerGroup = layout_.block_size / 2;
+
+        if (groupBytes == 0 || framesPerGroup == 0) {
+            return 0;
+        }
+
+        const size_t groupsAvail = pending_.size() / groupBytes;
+        const size_t groupsCap = (outCapacityFrames - written) / framesPerGroup;
+        const size_t groups = std::min(groupsAvail, groupsCap);
+
+        if (groups > 0) {
+            const uint8_t *base = pending_.data();
+
+            for (size_t g = 0; g < groups; ++g) {
+                const uint8_t *group = base + g * groupBytes;
+
+                for (size_t k = 0; k < framesPerGroup; ++k) {
+                    for (int c = 0; c < channels; ++c) {
+                        const uint8_t *block = group + static_cast<size_t>(c) * layout_.block_size;
+
+                        emit(block[2 * k], block[2 * k + 1], written + k, c);
+                    }
+
+                    markerOdd_ = !markerOdd_;
+                }
+
+                written += framesPerGroup;
+            }
+
+            pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(groups * groupBytes));
+        }
+
+        return written;
+    }
+
+    const size_t pairBytes = 2 * static_cast<size_t>(channels);
+
+    if (pairBytes == 0) {
+        return 0;
+    }
+
+    const size_t framesAvail = pending_.size() / pairBytes;
+    const size_t frames = std::min(framesAvail, outCapacityFrames - written);
+
+    if (frames > 0) {
+        const uint8_t *base = pending_.data();
+
+        for (size_t k = 0; k < frames; ++k) {
+            const uint8_t *first = base + (2 * k) * static_cast<size_t>(channels);
+
+            const uint8_t *second = base + (2 * k + 1) * static_cast<size_t>(channels);
+
+            for (int c = 0; c < channels; ++c) {
+                emit(first[c], second[c], written + k, c);
+            }
+
+            markerOdd_ = !markerOdd_;
+        }
+
+        pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(frames * pairBytes));
 
         written += frames;
     }

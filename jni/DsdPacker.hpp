@@ -50,7 +50,10 @@ struct DsdSourceLayout {
  * avoids the PCM-container framing overhead entirely.
  */
 DsdOutputMode choose_dsd_output_mode(
-    const tinyalsa::pcm_params &params, tinyalsa::size_type dsdRate, bool allowNative, bool allowDop,
+    const tinyalsa::pcm_params &params,
+    tinyalsa::size_type dsdRate,
+    bool allowNative,
+    bool allowDop,
     tinyalsa::sample_format *outNativeFmt = nullptr
 );
 
@@ -115,6 +118,16 @@ public:
      * @return Number of output frames written.
      */
     size_t pack(const uint8_t *in, size_t inBytes, int32_t *out, size_t outCapacityFrames);
+
+    /**
+     * @brief Packs DoP frames into packed S24_3LE little-endian samples.
+     * @param in                Raw packet bytes exactly as read from the demuxer.
+     * @param inBytes           Size of @p in in bytes.
+     * @param out               Destination buffer, interleaved by channel.
+     * @param outCapacityFrames Capacity of @p out in frames (channels int32_t entries each).
+     * @return Number of output frames written.
+     */
+    size_t pack24(const uint8_t *in, size_t inBytes, uint8_t *out, size_t outCapacityFrames);
 
 private:
     DsdSourceLayout layout_;

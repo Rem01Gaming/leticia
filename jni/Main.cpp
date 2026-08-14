@@ -357,11 +357,11 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
         }
         out_fmt = native_fmt;
     } else {
-        // dsd_rate is FFmpeg's dsf/dsdiff sample_rate: an already-halved byte rate
-        // (bit rate / 8), so DoP's 2-bytes-per-word packing gives dop_rate = dsd_rate / 2.
-        // See the matching note in DsdPacker.cpp::choose_dsd_output_mode.
         tinyalsa::size_type dop_rate = dsd_rate / 2;
-        if (params.test_config((tinyalsa::size_type)channels, dop_rate, tinyalsa::sample_format::s24_le)) {
+
+        if (params.test_config((tinyalsa::size_type)channels, dop_rate, tinyalsa::sample_format::s24_3le)) {
+            out_fmt = tinyalsa::sample_format::s24_3le;
+        } else if (params.test_config((tinyalsa::size_type)channels, dop_rate, tinyalsa::sample_format::s24_le)) {
             out_fmt = tinyalsa::sample_format::s24_le;
         } else if (params.test_config((tinyalsa::size_type)channels, dop_rate, tinyalsa::sample_format::s32_le)) {
             out_fmt = tinyalsa::sample_format::s32_le;
@@ -445,11 +445,11 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
 
     if (!configured) {
         std::cerr << RED << "ERROR: PCM configuration failed"
-                  << " (channels=" << channels << " rate=" << out_rate
-                  << " format=" << tinyalsa::to_string(out_fmt)
-                  << ", last tried period_size=" << last_size << " period_count=" << last_count
-                  << ", failed at " << (last_failed_at_prepare ? "prepare" : "hw_params")
-                  << ", errno=" << last_errno << " [" << tinyalsa::get_error_description(last_errno) << "])\n" << RESET;
+                  << " (channels=" << channels << " rate=" << out_rate << " format=" << tinyalsa::to_string(out_fmt)
+                  << ", last tried period_size=" << last_size << " period_count=" << last_count << ", failed at "
+                  << (last_failed_at_prepare ? "prepare" : "hw_params") << ", errno=" << last_errno << " ["
+                  << tinyalsa::get_error_description(last_errno) << "])\n"
+                  << RESET;
         writer.close();
         avformat_close_input(&fmt_ctx);
         return 1;
@@ -481,6 +481,7 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
     DopPacker dop_packer(layout, widen_dop_to_32bit);
     NativeDsdPacker native_packer(layout, native_fmt);
     const size_t out_frame_bytes = tinyalsa::bytes_per_frame(out_fmt, (tinyalsa::size_type)channels);
+    const bool dop_packed_24 = (mode == DsdOutputMode::Dop && out_fmt == tinyalsa::sample_format::s24_3le);
 
     AVPacket *pkt = av_packet_alloc();
     std::vector<uint8_t> out_buf;
@@ -570,17 +571,15 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
         size_t needed_frames = 0;
 
         if (mode == DsdOutputMode::Native) {
-            const size_t containerBytes =
-                static_cast<size_t>(tinyalsa::bytes_per_frame(native_fmt, 1));
+            const size_t containerBytes = static_cast<size_t>(tinyalsa::bytes_per_frame(native_fmt, 1));
 
             if (containerBytes == 0) {
                 av_packet_unref(pkt);
                 continue;
             }
 
-            needed_frames = layout.planar
-                ? (layout.block_size / containerBytes)
-                : (static_cast<size_t>(pkt->size) / static_cast<size_t>(channels) / containerBytes);
+            needed_frames = layout.planar ? (layout.block_size / containerBytes) :
+                                            (static_cast<size_t>(pkt->size) / static_cast<size_t>(channels) / containerBytes);
         } else {
             needed_frames = dop_packer.max_output_frames_for(static_cast<size_t>(pkt->size));
         }
@@ -590,10 +589,17 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
         size_t produced_bytes;
         if (mode == DsdOutputMode::Native) {
             produced_bytes = native_packer.pack(pkt->data, (size_t)pkt->size, out_buf.data(), out_buf.size());
+        } else if (dop_packed_24) {
+            size_t produced_frames =
+                dop_packer.pack24(pkt->data, (size_t)pkt->size, out_buf.data(), out_buf.size() / out_frame_bytes);
+
+            produced_bytes = produced_frames * out_frame_bytes;
         } else {
-            produced_bytes = dop_packer.pack(
-                pkt->data, (size_t)pkt->size, reinterpret_cast<int32_t *>(out_buf.data()), out_buf.size() / out_frame_bytes
-            ) * out_frame_bytes;
+            produced_bytes =
+                dop_packer.pack(
+                    pkt->data, (size_t)pkt->size, reinterpret_cast<int32_t *>(out_buf.data()), out_buf.size() / out_frame_bytes
+                ) *
+                out_frame_bytes;
         }
 
         if (pkt->pts != AV_NOPTS_VALUE) current_pos_sec = pkt->pts * av_q2d(stream->time_base);
@@ -702,8 +708,12 @@ static int play_dsd_raw(const std::string &file_path, const AlsaDevice &dev, Dsd
 
 // ─── Core playback ────────────────────────────────────────────────────────────
 static int play(
-    const std::string &file_path, const AlsaDevice &dev, bool enable_replaygain, bool force_software_mixer,
-    bool allow_native_dsd, bool allow_dop
+    const std::string &file_path,
+    const AlsaDevice &dev,
+    bool enable_replaygain,
+    bool force_software_mixer,
+    bool allow_native_dsd,
+    bool allow_dop
 ) {
     tinyalsa::size_type card = dev.card;
     tinyalsa::size_type device = dev.device;
@@ -1201,8 +1211,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc < 2) {
-        std::cerr << YELLOW
-                  << "Usage: " << argv[0]
+        std::cerr << YELLOW << "Usage: " << argv[0]
                   << " <file> [hw:card,device] [--replaygain] [--software-mixer] [--dop] [--native-dsd] [--pcm-only]\n"
                   << RESET;
         return 1;
