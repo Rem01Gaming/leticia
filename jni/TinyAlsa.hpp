@@ -351,6 +351,16 @@ struct pcm_config final {
      * time of the most recent hardware pointer update rather than being left at zero.
      */
     bool enable_timestamps = false;
+
+    /** @brief Clock source backing @ref pcm::get_timestamp() (sw_params.tstamp_type). */
+    enum class timestamp_clock {
+        realtime,      ///< SNDRV_PCM_TSTAMP_TYPE_GETTIMEOFDAY
+        monotonic,     ///< SNDRV_PCM_TSTAMP_TYPE_MONOTONIC
+        monotonic_raw, ///< SNDRV_PCM_TSTAMP_TYPE_MONOTONIC_RAW, unaffected by NTP slew
+    };
+
+    /** @brief Only takes effect when enable_timestamps is true. */
+    timestamp_clock tstamp_clock = timestamp_clock::realtime;
 };
 
 // ============================================================================
@@ -483,7 +493,8 @@ public:
      * @brief Pauses or resumes the stream without discarding buffered data.
      * @param enable @c true to pause, @c false to resume.
      * @note Not all drivers support pause, @c ENOSYS is returned if unsupported.
-     * Check @c SND_PCM_INFO_PAUSE in the device info flags before relying on this.
+     * Check @ref pcm_params::supports_pause() (SNDRV_PCM_INFO_PAUSE, reported via
+     * HW_REFINE, not SNDRV_PCM_IOCTL_INFO) before relying on this.
      */
     result pause(bool enable) noexcept;
 
@@ -545,8 +556,50 @@ public:
      */
     generic_result<timestamp> get_timestamp() const noexcept;
 
+    /** @brief Which hardware/link clock an @ref extended_timestamp was actually measured against, mirrors SNDRV_PCM_AUDIO_TSTAMP_TYPE_*. */
+    enum class audio_tstamp_type {
+        compat = 0,           ///< Backward-compatible auto-selection; no accuracy report.
+        default_dma = 1,      ///< DMA time, derived from hw_ptr.
+        link = 2,              ///< Link/wallclock counter time, reset on stream start.
+        link_absolute = 3,    ///< Link/wallclock counter time, not reset on stream start.
+        link_estimated = 4,   ///< Link time estimated indirectly.
+        link_synchronized = 5 ///< Link time synchronized with system time.
+    };
+
+    /** @brief Result of get_extended_timestamp(): both clock domains plus the driver's accuracy report. */
+    struct extended_timestamp final {
+        timestamp system;          ///< System clock time of this refresh (per pcm_config::tstamp_clock).
+        timestamp audio;           ///< Hardware/link time, per requested_type.
+        audio_tstamp_type actual_type = audio_tstamp_type::compat; ///< Type the driver actually reported (may differ from the request).
+        bool accuracy_valid = false; ///< True if accuracy_ns is meaningful.
+        unsigned int accuracy_ns = 0; ///< Reported accuracy of @ref audio, in nanoseconds.
+    };
+
+    /**
+     * @brief Requests a specific hardware/link timestamp type and reads both
+     * clock domains plus the driver's accuracy report in one call
+     * (SNDRV_PCM_IOCTL_STATUS_EXT).
+     * @note Unlike get_timestamp(), this always asks the driver for a fresh
+     * hw_ptr/audio_tstamp pair rather than returning whatever was cached
+     * from the last STATUS call.
+     */
+    generic_result<extended_timestamp> get_extended_timestamp(audio_tstamp_type requested_type = audio_tstamp_type::default_dma) const noexcept;
+
     result open_capture_device(size_type card = 0, size_type device = 0, bool non_blocking = true) noexcept;
     result open_playback_device(size_type card = 0, size_type device = 0, bool non_blocking = true) noexcept;
+
+    /**
+     * @brief Groups this stream with @p other so a single start()/drop()/etc.
+     * on either substream triggers both together (SNDRV_PCM_IOCTL_LINK).
+     * @note Typical embedded use: linking a playback and capture substream
+     * on the same codec so echo-cancellation reference and output share one
+     * hardware trigger. Both streams must already be prepared and belong to
+     * the same driver/card grouping the kernel allows to link.
+     */
+    result link(const pcm &other) noexcept;
+
+    /** @brief Removes this stream from whatever link group it belongs to (SNDRV_PCM_IOCTL_UNLINK). */
+    result unlink() noexcept;
 
 protected:
     result setup(const pcm_config &config, sample_access access, bool is_capture) noexcept;
@@ -763,6 +816,48 @@ public:
 };
 
 // ============================================================================
+// pcm_period_timer
+// ============================================================================
+
+/**
+ * @brief Binds to the kernel's SNDRV_TIMER_CLASS_PCM tick source for a PCM
+ * substream, so callers keep getting period-accurate wakeups after
+ * pcm_config::disable_period_wakeup has told the driver to stop waking
+ * poll() on the audio device fd itself.
+ * @note This is the same mechanism alsa-lib/pipewire fall back to for
+ * NO_PERIOD_WAKEUP streams: a slave-class timer device that the PCM core
+ * always registers alongside the substream, independent of whether the
+ * hardware IRQ still wakes callers directly.
+ */
+class pcm_period_timer final {
+    int fd = invalid_fd();
+
+public:
+    pcm_period_timer() noexcept = default;
+    pcm_period_timer(pcm_period_timer &&other) noexcept;
+    pcm_period_timer &operator=(pcm_period_timer &&other) noexcept;
+    ~pcm_period_timer();
+
+    /**
+     * @param card, device, is_capture Must match the PCM substream to follow.
+     * @param subdevice Substream index within the device; 0 unless the
+     * device exposes multiple hardware subdevices.
+     */
+    result open(size_type card, size_type device, bool is_capture, size_type subdevice = 0) noexcept;
+    void close() noexcept;
+    bool is_open() const noexcept;
+
+    /** @brief Raw fd, poll()-able alongside (or instead of) the PCM device fd. */
+    int get_file_descriptor() const noexcept;
+
+    /**
+     * @brief Blocks until at least one period tick has been queued.
+     * @return Number of ticks consumed by this read, or ENOENT if not open.
+     */
+    generic_result<size_type> wait_for_tick() noexcept;
+};
+
+// ============================================================================
 // pcm_list
 // ============================================================================
 
@@ -821,7 +916,7 @@ public:
 
     /**
      * @brief Tests whether channels, rate, and format are all achievable together
-     * in a single hw_params refine, rather than the three independently.
+     * in a single hw_params refine.
      * @note test_format()/test_rate()/test_channels() each refine only one axis
      * against the full device capability baseline, so a device that restricts a
      * format to certain rates (or vice versa) can pass each test individually
@@ -871,6 +966,34 @@ public:
      * @brief Returns the maximum total ring-buffer size in frames.
      */
     generic_result<size_type> get_max_buffer_size() const noexcept;
+
+    /**
+     * @brief Raw SNDRV_PCM_INFO_* capability bits from the initial HW_REFINE probe.
+     * @note Decode with the mask constants in <sound/asound.h>, or use the
+     * named predicates below.
+     */
+    unsigned int get_capabilities() const noexcept;
+
+     /**
+     * @brief True if pause()/resume() are expected to work (SNDRV_PCM_INFO_PAUSE).
+     */
+    bool supports_pause() const noexcept;
+
+    /**
+     * @brief True if the stream can resume after suspend (SNDRV_PCM_INFO_RESUME).
+     */
+    bool supports_resume() const noexcept;
+
+    /**
+     * @brief True if mmap-based access (mmap_pcm_reader/writer) is usable (SNDRV_PCM_INFO_MMAP).
+     */
+    bool supports_mmap() const noexcept;
+
+    /**
+     * @brief True if the SYNC_PTR ioctl fallback is required instead of the
+     * direct-mmap pointer path (SNDRV_PCM_INFO_SYNC_APPLPTR or _EXPLICIT_SYNC).
+     */
+    bool needs_explicit_sync() const noexcept;
 };
 
 // ============================================================================
@@ -918,6 +1041,7 @@ class mixer_ctl {
     char *enum_names_ = nullptr;
     unsigned int enum_items_count_ = 0;
     bool has_tlv_ = false;
+    bool has_tlv_write_ = false;
 
     mixer_ctl() noexcept = default;
 
@@ -1073,6 +1197,11 @@ public:
         return has_tlv_;
     }
 
+    /** @brief True if this control accepts a driver-defined TLV write (SNDRV_CTL_ELEM_ACCESS_TLV_WRITE). */
+    bool has_tlv_write() const noexcept {
+        return has_tlv_write_;
+    }
+
     /** @brief Decoded dB range for a volume control, from its SNDRV_CTL_TLVT_DB_SCALE/DB_MINMAX(_MUTE) TLV. */
     struct dB_range final {
         long min_millibel = 0;  ///< Volume at get_min(), in hundredths of a dB
@@ -1100,6 +1229,16 @@ public:
      * @return Number of words actually written into @p buffer.
      */
     generic_result<size_type> get_tlv_raw(unsigned int *buffer, size_type buffer_words) const noexcept;
+
+    /**
+     * @brief Writes a raw TLV blob (SNDRV_CTL_IOCTL_TLV_WRITE) for control
+     * types this wrapper doesn't build itself, such as driver-defined
+     * EQ/DRC coefficient blocks on smart-amp/DSP codecs.
+     * @param buffer       Source 32-bit TLV words (type, length, payload...).
+     * @param buffer_words Number of 32-bit words in @p buffer.
+     * @return ENOSYS if has_tlv_write() is false.
+     */
+    result set_tlv_raw(const unsigned int *buffer, size_type buffer_words) const noexcept;
 };
 
 // ============================================================================

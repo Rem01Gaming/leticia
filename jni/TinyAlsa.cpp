@@ -372,7 +372,14 @@ constexpr snd_pcm_sw_params to_alsa_sw_params(const pcm_config &config, bool is_
     params.xfer_align = config.period_size / 2;
     params.silence_size = 0;
     params.silence_threshold = config.silence_threshold;
-    if (config.enable_timestamps) params.tstamp_mode = SNDRV_PCM_TSTAMP_ENABLE;
+    if (config.enable_timestamps) {
+        params.tstamp_mode = SNDRV_PCM_TSTAMP_ENABLE;
+        switch (config.tstamp_clock) {
+            case pcm_config::timestamp_clock::monotonic: params.tstamp_type = SNDRV_PCM_TSTAMP_TYPE_MONOTONIC; break;
+            case pcm_config::timestamp_clock::monotonic_raw: params.tstamp_type = SNDRV_PCM_TSTAMP_TYPE_MONOTONIC_RAW; break;
+            case pcm_config::timestamp_clock::realtime: default: params.tstamp_type = SNDRV_PCM_TSTAMP_TYPE_GETTIMEOFDAY; break;
+        }
+    }
     return params;
 }
 
@@ -777,6 +784,40 @@ generic_result<pcm::timestamp> pcm::get_timestamp() const noexcept {
     return R{0, ts};
 }
 
+namespace {
+
+// Bit layout fixed by snd_pcm_(un)pack_audio_tstamp_config/_report in the kernel's
+// <sound/pcm.h>: low 16 bits of audio_tstamp_data are the request (type in bits
+// 0-3, report_delay in bit 4); the high 16 bits are the driver's report (valid in
+// bit 16, actual_type in bits 17-20, accuracy_report in bit 21) after the ioctl.
+constexpr unsigned int pack_audio_tstamp_request(pcm::audio_tstamp_type requested) noexcept {
+    return static_cast<unsigned int>(requested) & 0xFu;
+}
+
+} // namespace
+
+generic_result<pcm::extended_timestamp> pcm::get_extended_timestamp(audio_tstamp_type requested_type) const noexcept {
+    using R = generic_result<extended_timestamp>;
+    if (!self) return R{ENOENT};
+
+    snd_pcm_status status{};
+    status.audio_tstamp_data = pack_audio_tstamp_request(requested_type);
+    if (::ioctl(self->fd, SNDRV_PCM_IOCTL_STATUS_EXT, &status) < 0) return R{errno};
+
+    extended_timestamp out{};
+    out.system.seconds = static_cast<long>(status.tstamp.tv_sec);
+    out.system.nanoseconds = static_cast<long>(status.tstamp.tv_nsec);
+    out.audio.seconds = static_cast<long>(status.audio_tstamp.tv_sec);
+    out.audio.nanoseconds = static_cast<long>(status.audio_tstamp.tv_nsec);
+
+    unsigned int report = status.audio_tstamp_data >> 16;
+    bool valid = (report & 0x1u) != 0;
+    out.actual_type = static_cast<audio_tstamp_type>((report >> 1) & 0xFu);
+    out.accuracy_valid = valid && ((report >> 5) & 0x1u) != 0;
+    out.accuracy_ns = out.accuracy_valid ? status.audio_tstamp_accuracy : 0;
+    return R{0, out};
+}
+
 result pcm::setup(const pcm_config &config, sample_access access, bool is_capture) noexcept {
     auto hw_params = to_alsa_hw_params(config, access);
     auto err = ioctl(get_file_descriptor(), SNDRV_PCM_IOCTL_HW_PARAMS, &hw_params);
@@ -787,6 +828,20 @@ result pcm::setup(const pcm_config &config, sample_access access, bool is_captur
     if (err < 0) return errno;
 
     return 0;
+}
+
+result pcm::link(const pcm &other) noexcept {
+    if (!self) return ENOENT;
+    int other_fd = other.get_file_descriptor();
+    if (other_fd == invalid_fd()) return EINVAL;
+    if (::ioctl(self->fd, SNDRV_PCM_IOCTL_LINK, other_fd) < 0) return errno;
+    return result();
+}
+
+result pcm::unlink() noexcept {
+    if (!self) return ENOENT;
+    if (::ioctl(self->fd, SNDRV_PCM_IOCTL_UNLINK) < 0) return errno;
+    return result();
 }
 
 result pcm::open_capture_device(size_type card, size_type device, bool non_blocking) noexcept {
@@ -964,7 +1019,7 @@ int mmap_begin_write(
     int fd, size_type appl_ptr, size_type buffer_frames, size_type boundary, size_type frame_bytes, void *mmap_data, mmap_region *out
 ) noexcept {
     snd_pcm_sync_ptr sptr{};
-    sptr.flags = SNDRV_PCM_SYNC_PTR_HWSYNC;
+    sptr.flags = SNDRV_PCM_SYNC_PTR_HWSYNC | SNDRV_PCM_SYNC_PTR_APPL;
     if (UNLIKELY(ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sptr) < 0)) return errno;
     return compute_write_region(sptr.s.status.hw_ptr, appl_ptr, buffer_frames, boundary, frame_bytes, mmap_data, out);
 }
@@ -973,7 +1028,7 @@ int mmap_begin_read(
     int fd, size_type appl_ptr, size_type buffer_frames, size_type boundary, size_type frame_bytes, void *mmap_data, mmap_region *out
 ) noexcept {
     snd_pcm_sync_ptr sptr{};
-    sptr.flags = SNDRV_PCM_SYNC_PTR_HWSYNC;
+    sptr.flags = SNDRV_PCM_SYNC_PTR_HWSYNC | SNDRV_PCM_SYNC_PTR_APPL;
     if (UNLIKELY(ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sptr) < 0)) return errno;
     return compute_read_region(sptr.s.status.hw_ptr, appl_ptr, buffer_frames, boundary, frame_bytes, mmap_data, out);
 }
@@ -983,12 +1038,8 @@ int mmap_commit_common(int fd, size_type *appl_ptr, size_type frames, size_type 
     if (*appl_ptr >= boundary) *appl_ptr -= boundary;
 
     snd_pcm_sync_ptr sptr{};
-    sptr.flags = SNDRV_PCM_SYNC_PTR_APPL;
+    sptr.flags = 0;
     sptr.c.control.appl_ptr = *appl_ptr;
-    // Must echo the avail_min negotiated at SW_PARAMS time. Overwriting it
-    // with a smaller value (e.g. 1) resets the kernel's poll/wakeup
-    // threshold on every commit, causing a wakeup storm instead of one
-    // wakeup per period.
     sptr.c.control.avail_min = avail_min;
     if (UNLIKELY(ioctl(fd, SNDRV_PCM_IOCTL_SYNC_PTR, &sptr) < 0)) return errno;
     return 0;
@@ -1120,6 +1171,96 @@ result mmap_pcm_reader::commit(size_type frames) noexcept {
         return 0;
     }
     return mmap_commit_common(get_file_descriptor(), &appl_ptr_, frames, boundary_, avail_min_);
+}
+
+// ============================================================================
+// pcm_period_timer
+// ============================================================================
+
+pcm_period_timer::pcm_period_timer(pcm_period_timer &&other) noexcept
+    : fd(other.fd) {
+    other.fd = invalid_fd();
+}
+
+pcm_period_timer &pcm_period_timer::operator=(pcm_period_timer &&other) noexcept {
+    if (this != &other) {
+        close();
+        fd = other.fd;
+        other.fd = invalid_fd();
+    }
+    return *this;
+}
+
+pcm_period_timer::~pcm_period_timer() {
+    close();
+}
+
+result pcm_period_timer::open(size_type card, size_type device, bool is_capture, size_type subdevice) noexcept {
+    close();
+
+    fd = ::open("/dev/snd/timer", O_RDWR);
+    if (fd < 0) {
+        fd = invalid_fd();
+        return result{errno};
+    }
+
+    snd_timer_select select{};
+    select.id.dev_class = SNDRV_TIMER_CLASS_PCM;
+    select.id.dev_sclass = SNDRV_TIMER_SCLASS_NONE;
+    select.id.card = static_cast<int>(card);
+    select.id.device = static_cast<int>(device);
+    select.id.subdevice = static_cast<int>((subdevice << 1) | (is_capture ? 1u : 0u));
+    if (::ioctl(fd, SNDRV_TIMER_IOCTL_SELECT, &select) < 0) {
+        int err = errno;
+        ::close(fd);
+        fd = invalid_fd();
+        return result{err};
+    }
+
+    snd_timer_params params{};
+    params.flags = SNDRV_TIMER_PSFLG_AUTO;
+    params.ticks = 1;
+    params.queue_size = 32;
+    if (::ioctl(fd, SNDRV_TIMER_IOCTL_PARAMS, &params) < 0) {
+        int err = errno;
+        ::close(fd);
+        fd = invalid_fd();
+        return result{err};
+    }
+
+    if (::ioctl(fd, SNDRV_TIMER_IOCTL_START) < 0) {
+        int err = errno;
+        ::close(fd);
+        fd = invalid_fd();
+        return result{err};
+    }
+    return result();
+}
+
+void pcm_period_timer::close() noexcept {
+    if (fd != invalid_fd()) {
+        ::close(fd);
+        fd = invalid_fd();
+    }
+}
+
+bool pcm_period_timer::is_open() const noexcept {
+    return fd != invalid_fd();
+}
+
+int pcm_period_timer::get_file_descriptor() const noexcept {
+    return fd;
+}
+
+generic_result<size_type> pcm_period_timer::wait_for_tick() noexcept {
+    using R = generic_result<size_type>;
+    if (fd == invalid_fd()) return R{ENOENT};
+
+    snd_timer_read tick{};
+    auto n = ::read(fd, &tick, sizeof(tick));
+    if (n < 0) return R{errno};
+    if (static_cast<size_type>(n) != sizeof(tick)) return R{EIO};
+    return R{0, static_cast<size_type>(tick.ticks)};
 }
 
 // ============================================================================
@@ -1449,6 +1590,26 @@ generic_result<size_type> pcm_params::get_min_buffer_size() const noexcept {
     if (!is_open()) return {ENOENT};
     auto &i = self->params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
     return {0, i.min};
+}
+
+unsigned int pcm_params::get_capabilities() const noexcept {
+    return is_open() ? self->params.info : 0;
+}
+
+bool pcm_params::supports_pause() const noexcept {
+    return (get_capabilities() & SNDRV_PCM_INFO_PAUSE) != 0;
+}
+
+bool pcm_params::supports_resume() const noexcept {
+    return (get_capabilities() & SNDRV_PCM_INFO_RESUME) != 0;
+}
+
+bool pcm_params::supports_mmap() const noexcept {
+    return (get_capabilities() & SNDRV_PCM_INFO_MMAP) != 0;
+}
+
+bool pcm_params::needs_explicit_sync() const noexcept {
+    return (get_capabilities() & (SNDRV_PCM_INFO_SYNC_APPLPTR | SNDRV_PCM_INFO_EXPLICIT_SYNC)) != 0;
 }
 
 generic_result<size_type> pcm_params::get_max_buffer_size() const noexcept {
@@ -1826,6 +1987,27 @@ generic_result<size_type> mixer_ctl::get_tlv_raw(unsigned int *buffer, size_type
     return R{0, words_out};
 }
 
+result mixer_ctl::set_tlv_raw(const unsigned int *buffer, size_type buffer_words) const noexcept {
+    if (fd == invalid_fd()) return ENOENT;
+    if (!has_tlv_write_) return ENOSYS;
+    if (!buffer || buffer_words == 0) return EINVAL;
+
+    size_type alloc_bytes = sizeof(snd_ctl_tlv) + buffer_words * sizeof(unsigned int);
+    auto *raw = static_cast<unsigned char *>(malloc(alloc_bytes));
+    if (!raw) return ENOMEM;
+
+    auto *tlv = reinterpret_cast<snd_ctl_tlv *>(raw);
+    tlv->numid = numid_;
+    tlv->length = static_cast<unsigned int>(buffer_words * sizeof(unsigned int));
+    memcpy(tlv->tlv, buffer, tlv->length);
+
+    auto ioctl_err = ioctl(fd, SNDRV_CTL_IOCTL_TLV_WRITE, tlv);
+    int err = errno;
+    free(raw);
+    if (ioctl_err < 0) return err;
+    return result();
+}
+
 // ============================================================================
 // mixer_impl
 // ============================================================================
@@ -1961,6 +2143,7 @@ result mixer::open(size_type card) noexcept {
         ctl.elem_type_ = info.type;
         ctl.count_ = info.count;
         ctl.has_tlv_ = (info.access & SNDRV_CTL_ELEM_ACCESS_TLV_READ) != 0;
+        ctl.has_tlv_write_ = (info.access & SNDRV_CTL_ELEM_ACCESS_TLV_WRITE) != 0;
         strncpy(ctl.name_, reinterpret_cast<const char *>(info.id.name), sizeof(ctl.name_) - 1);
         ctl.name_[sizeof(ctl.name_) - 1] = '\0';
 
